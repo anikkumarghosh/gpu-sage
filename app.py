@@ -615,15 +615,16 @@ with left_col:
                     num_gpus=num_gpus,
                     ppo_model_path=ppo_path,
                 )
-                results = {st.session_state.seed_selector: metrics_map}
+                seed = st.session_state.seed_selector
+                results = {seed: metrics_map}
                 save_benchmark(
                     scenario=st.session_state.selected_scenario,
                     results=results,
                     out_dir="artifacts/benchmarks",
                     num_gpus=num_gpus,
                     num_jobs=16,
-                    per_job_results=per_job_map,
-                    ppo_logs=ppo_logs,
+                    per_job_results={seed: per_job_map},
+                    ppo_logs={seed: ppo_logs},
                 )
             st.session_state.benchmark_results = results
             # Build the ONE authoritative LiveState from the simulator
