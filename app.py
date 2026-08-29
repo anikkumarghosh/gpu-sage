@@ -596,9 +596,14 @@ with left_col:
                             "No graph/topology-trained PPO model found under artifacts/ppo_graph*/. "
                             "Falling back to heuristic scheduler."
                         )
-                else:
-                    cand = Path("artifacts/ppo/runs/20260829_184233_seed0_steps5000/model/final_model.zip")
-                    ppo_path = str(cand) if cand.exists() else None
+else:
+    cand = _latest_model("artifacts/ppo/runs/*/model/final_model.zip")
+    ppo_path = str(cand) if cand else None
+    if ppo_path is None:
+        st.warning(
+            "No homogeneous-trained PPO model found under artifacts/ppo/. "
+            "Falling back to heuristic scheduler."
+        )
             # Run one benchmark to get results
             # Note: run_benchmark_cached currently ignores ppo path; for hetero we use direct run_single_seed with path
             if ppo_path:
