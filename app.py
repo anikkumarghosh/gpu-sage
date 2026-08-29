@@ -371,10 +371,12 @@ def _build_live_state_from_simulator(
                         "idle_penalty": float(latest.get("idle_penalty", 0.0)),
                     }
                     # Build job lists from the decision log
-                    running_jobs = [int(latest.get("running_jobs", 0))] if latest.get("running_jobs") is not None else []
+                    # (we don't have real job IDs from the log, so use placeholder
+                    # lists sized to the logged counts purely for len() display)
+                    running_count = int(latest.get("running_jobs", 0))
                     completed_from_log = int(latest.get("completed_jobs", 0))
-                    # We can't reconstruct exact job IDs from the log alone,
-                    # so we'll leave selected_job as the ID and completed count below
+                    running_jobs = list(range(running_count))
+                    completed_jobs_list = list(range(completed_from_log))
                 else:
                     selected_job = None
                     selected_action = None
@@ -604,19 +606,24 @@ with left_col:
                             "No homogeneous-trained PPO model found under artifacts/ppo/. "
                             "Falling back to heuristic scheduler."
                         )
-                from gpu_sage.evaluation.benchmark import run_single_seed as _rss
-                import copy as _cp
-                base_jobs2 = generate_workload(scenario=st.session_state.selected_scenario, seed=st.session_state.seed_selector, count=16)
-                # Use run_single_seed with model for PPO
-                single = _rss(scenario=st.session_state.selected_scenario, seed=st.session_state.seed_selector, schedulers=[st.session_state.selected_scheduler], num_jobs=16, num_gpus=num_gpus, ppo_model_path=ppo_path)
-                results = {st.session_state.seed_selector: single}
-            else:
-                results = run_benchmark_cached(
+                from gpu_sage.evaluation.benchmark import run_single_seed_detailed_with_logs, save_benchmark
+                metrics_map, per_job_map, ppo_logs = run_single_seed_detailed_with_logs(
                     scenario=st.session_state.selected_scenario,
+                    seed=st.session_state.seed_selector,
                     schedulers=[st.session_state.selected_scheduler],
                     num_jobs=16,
                     num_gpus=num_gpus,
-                    seeds=[st.session_state.seed_selector],
+                    ppo_model_path=ppo_path,
+                )
+                results = {st.session_state.seed_selector: metrics_map}
+                save_benchmark(
+                    scenario=st.session_state.selected_scenario,
+                    results=results,
+                    out_dir="artifacts/benchmarks",
+                    num_gpus=num_gpus,
+                    num_jobs=16,
+                    per_job_results=per_job_map,
+                    ppo_logs=ppo_logs,
                 )
             st.session_state.benchmark_results = results
             # Build the ONE authoritative LiveState from the simulator
@@ -953,8 +960,28 @@ with left_col:
                         jrow = jdf_all[jdf_all["job_id"] == sel_id]
                         if not jrow.empty:
                             r = jrow.iloc[0]
-                            st.caption(f"Selected Job: #{sel_id}  GPUs={r.get('gpu_requirement','?')}  Mem={r.get('memory_requirement','?')}GB  Topology Sensitive: {r.get('topology_sensitive','?')}")
-                            st.caption(f"Assigned GPUs: {r.get('assigned_gpus','?')}  Placement Penalty: {r.get('placement_penalty','?')}  Communication Cost: {r.get('communication_cost','?')}")
+
+                            def _fmt(val, default="N/A", precision=1):
+                                if pd.isna(val) or val is None or val == "?" or str(val).strip() == "":
+                                    return default
+                                try:
+                                    fval = float(val)
+                                    if precision == 0:
+                                        return str(int(round(fval)))
+                                    return f"{fval:.{precision}f}"
+                                except (ValueError, TypeError):
+                                    return str(val)
+
+                            gpu_req = _fmt(r.get("gpu_requirement"), precision=0)
+                            mem_req = _fmt(r.get("memory_requirement"), precision=1)
+                            topo_sens = _fmt(r.get("topology_sensitive"))
+                            assigned_gpus = _fmt(r.get("assigned_gpus"))
+                            place_pen = _fmt(r.get("placement_penalty"), precision=2)
+                            comm_cost = _fmt(r.get("communication_cost"), precision=2)
+
+                            mem_str = f"{mem_req}GB" if mem_req != "N/A" else "N/A"
+                            st.caption(f"Selected Job: #{sel_id} | GPUs={gpu_req} | Mem={mem_str} | Topology Sensitive: {topo_sens}")
+                            st.caption(f"Assigned GPUs: {assigned_gpus} | Placement Penalty: {place_pen} | Communication Cost: {comm_cost}")
                         else:
                             st.caption("Placement details: job not found in current state records")
                 except Exception as e:
