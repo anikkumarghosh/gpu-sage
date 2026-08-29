@@ -596,17 +596,14 @@ with left_col:
                             "No graph/topology-trained PPO model found under artifacts/ppo_graph*/. "
                             "Falling back to heuristic scheduler."
                         )
-else:
-    cand = _latest_model("artifacts/ppo/runs/*/model/final_model.zip")
-    ppo_path = str(cand) if cand else None
-    if ppo_path is None:
-        st.warning(
-            "No homogeneous-trained PPO model found under artifacts/ppo/. "
-            "Falling back to heuristic scheduler."
-        )
-            # Run one benchmark to get results
-            # Note: run_benchmark_cached currently ignores ppo path; for hetero we use direct run_single_seed with path
-            if ppo_path:
+                else:
+                    cand = _latest_model("artifacts/ppo/runs/*/model/final_model.zip")
+                    ppo_path = str(cand) if cand else None
+                    if ppo_path is None:
+                        st.warning(
+                            "No homogeneous-trained PPO model found under artifacts/ppo/. "
+                            "Falling back to heuristic scheduler."
+                        )
                 from gpu_sage.evaluation.benchmark import run_single_seed as _rss
                 import copy as _cp
                 base_jobs2 = generate_workload(scenario=st.session_state.selected_scenario, seed=st.session_state.seed_selector, count=16)
