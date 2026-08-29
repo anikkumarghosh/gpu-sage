@@ -1,0 +1,16 @@
+# Reward F — Balanced candidate (normalized)
+# Motivation: Component scale analysis shows waiting penalty dominates (sum_wait ~1000 → 20)
+# vs util ~1 and throughput ~2. To make weights comparable, normalize waiting by
+# queue length: waiting_penalty = waiting * (sum_wait / N_wait) = waiting * avg_wait.
+# Avg wait is typically 10-100, so penalty becomes ~0.03*50=1.5, comparable to util.
+# Slightly increase throughput (2.0→2.5) and util/frag (0.25→0.4) to balance.
+# This tests whether scale-normalized, balanced shaping improves Avg JCT / P95
+# without starving large jobs.
+reward:
+  throughput: 2.5
+  waiting: 0.03
+  utilization: 0.4
+  fragmentation: 0.4
+  invalid: 1.0
+  idle: 0.01
+  waiting_normalization: mean

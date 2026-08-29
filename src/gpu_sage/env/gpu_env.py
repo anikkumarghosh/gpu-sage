@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
@@ -19,7 +20,34 @@ from gpu_sage.workloads.generator import SyntheticWorkload, WorkloadConfig
 
 @dataclass(frozen=True)
 class RewardConfig:
-    """Weights for the shaped scheduling reward."""
+    """Weights for the shaped scheduling reward.
+
+    Current reward equation (per environment step, elapsed = cur - prev):
+
+        interval_util = gpu_time_delta / (elapsed * num_gpus)  in [0,1]
+        frag = 1 - min(max_feasible_gpus, free_gpus)/free_gpus  in [0,1]  (0 if free==0)
+
+        throughput_reward   = throughput * completed_delta
+        waiting_penalty     = waiting * sum(max(0, cur - arrival) for j in waiting)
+        utilization_reward  = utilization * interval_util * elapsed
+        fragmentation_penalty = fragmentation * frag * elapsed
+        idle_penalty        = idle * elapsed   if interval_util==0 and elapsed>0 else 0
+        invalid_penalty     = invalid_action   if invalid else 0
+
+        total = throughput_reward - waiting_penalty + utilization_reward
+                - fragmentation_penalty - idle_penalty - invalid_penalty
+
+    Notes:
+    - `elapsed` scales utilization/fragmentation/idle linearly with time.
+    - `waiting` sum is NOT normalized by elapsed or queue length; large queues
+      dominate (observed ~20 per step vs ~1 for util). See reward ablation
+      for normalization analysis (Reward F uses mean waiting).
+    - All components are computed from information available at the transition
+      (no future info), suitable for PPO training.
+    - Config is yaml-loadable via `RewardConfig.from_dict` and `load_reward_config`.
+    - Optional `waiting_normalization: "sum" | "mean"` — "mean" normalizes waiting
+      by queue length (avg waiting) to keep scale comparable to util (~1).
+    """
 
     throughput: float = 2.0
     waiting: float = 0.02
@@ -27,6 +55,46 @@ class RewardConfig:
     fragmentation: float = 0.25
     invalid_action: float = 1.0
     idle: float = 0.01
+    waiting_normalization: str = "sum"  # "sum" or "mean"
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RewardConfig":
+        return cls(
+            throughput=float(d.get("throughput", 2.0)),
+            waiting=float(d.get("waiting", 0.02)),
+            utilization=float(d.get("utilization", 0.25)),
+            fragmentation=float(d.get("fragmentation", 0.25)),
+            invalid_action=float(d.get("invalid_action", d.get("invalid", 1.0))),
+            idle=float(d.get("idle", 0.01)),
+            waiting_normalization=str(d.get("waiting_normalization", "sum")),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "throughput": self.throughput,
+            "waiting": self.waiting,
+            "utilization": self.utilization,
+            "fragmentation": self.fragmentation,
+            "invalid_action": self.invalid_action,
+            "idle": self.idle,
+            "waiting_normalization": self.waiting_normalization,
+        }
+
+
+def load_reward_config(path: str | Path | None) -> RewardConfig:
+    """Load RewardConfig from yaml file. Falls back to defaults if path is None/missing."""
+    if path is None:
+        return RewardConfig()
+    p = Path(path)
+    if not p.exists():
+        return RewardConfig()
+    import yaml
+
+    data = yaml.safe_load(p.read_text()) or {}
+    # Support both `reward:` top-level and flat keys
+    if "reward" in data and isinstance(data["reward"], dict):
+        data = data["reward"]
+    return RewardConfig.from_dict(data)
 
 
 class GPUSchedulingEnv(gym.Env):
@@ -177,6 +245,44 @@ class GPUSchedulingEnv(gym.Env):
         """MaskablePPO-compatible action mask method."""
         return self.action_mask()
 
+    def _reward_components(
+        self,
+        previous_time: float,
+        previous_gpu_time: float,
+        completed_before: int,
+        invalid: bool,
+    ) -> dict[str, float]:
+        """Compute per-component contributions; total = sum(values)."""
+        assert self.sim is not None
+        cfg = self.reward_config
+        elapsed = self.sim.current_time - previous_time
+        gpu_time_delta = self.sim.gpu_time_used - previous_gpu_time
+        capacity = elapsed * self.num_gpus
+        interval_utilization = gpu_time_delta / capacity if capacity > 0 else 0.0
+
+        # Waiting sum — optionally normalized by queue length for scale comparability
+        waiting_sum = sum(max(0.0, self.sim.current_time - j.arrival_time) for j in self.sim.waiting_jobs.values())
+        if cfg.waiting_normalization == "mean":
+            qlen = len(self.sim.waiting_jobs)
+            waiting_sum = waiting_sum / max(qlen, 1) if qlen else 0.0
+
+        frag = self._fragmentation()
+
+        comp = {}
+        comp["throughput_reward"] = float(cfg.throughput * (len(self.sim.completed_jobs) - completed_before))
+        comp["waiting_penalty"] = float(-cfg.waiting * waiting_sum)
+        comp["utilization_reward"] = float(cfg.utilization * interval_utilization * elapsed)
+        comp["fragmentation_penalty"] = float(-cfg.fragmentation * frag * elapsed)
+        comp["idle_penalty"] = float(-cfg.idle * elapsed if (elapsed > 0 and interval_utilization == 0.0) else 0.0)
+        comp["invalid_penalty"] = float(-cfg.invalid_action if invalid else 0.0)
+        comp["total_reward"] = float(sum(comp.values()))
+        # Also expose raw intermediates for analysis
+        comp["_elapsed"] = float(elapsed)
+        comp["_interval_util"] = float(interval_utilization)
+        comp["_frag"] = float(frag)
+        comp["_waiting_sum"] = float(waiting_sum)
+        return comp
+
     def _reward(
         self,
         previous_time: float,
@@ -184,31 +290,7 @@ class GPUSchedulingEnv(gym.Env):
         completed_before: int,
         invalid: bool,
     ) -> float:
-        assert self.sim is not None
-        cfg = self.reward_config
-        elapsed = self.sim.current_time - previous_time
-
-        # GPU utilization over the actual transition interval. This avoids
-        # incorrectly giving zero utilization when a completion event occurs
-        # exactly at the end of a busy interval.
-        gpu_time_delta = self.sim.gpu_time_used - previous_gpu_time
-        capacity = elapsed * self.num_gpus
-        interval_utilization = gpu_time_delta / capacity if capacity > 0 else 0.0
-
-        reward = cfg.utilization * interval_utilization * elapsed
-        reward -= cfg.waiting * sum(
-            max(0.0, self.sim.current_time - j.arrival_time)
-            for j in self.sim.waiting_jobs.values()
-        )
-        reward -= cfg.fragmentation * self._fragmentation() * elapsed
-        if elapsed > 0 and interval_utilization == 0.0:
-            reward -= cfg.idle * elapsed
-
-        completed_delta = len(self.sim.completed_jobs) - completed_before
-        reward += cfg.throughput * completed_delta
-        if invalid:
-            reward -= cfg.invalid_action
-        return float(reward)
+        return float(self._reward_components(previous_time, previous_gpu_time, completed_before, invalid)["total_reward"])
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed)
@@ -268,7 +350,9 @@ class GPUSchedulingEnv(gym.Env):
         terminated = len(self.sim.event_queue) == 0 and not self.sim.waiting_jobs and not self.sim.running_jobs
         truncated = False
         self._episode_done = terminated or truncated
-        reward = self._reward(previous_time, previous_gpu_time, completed_before, invalid)
+        # Compute reward components (total = sum) — exposed for ablation analysis
+        reward_components = self._reward_components(previous_time, previous_gpu_time, completed_before, invalid)
+        reward = float(reward_components["total_reward"])
         obs = self._observation()
         info = {
             "action_mask": self.action_mask() if not self._episode_done else np.ones(self.max_jobs + 1, dtype=bool),
@@ -278,6 +362,8 @@ class GPUSchedulingEnv(gym.Env):
             "waiting_jobs": len(self.sim.waiting_jobs),
             "running_jobs": len(self.sim.running_jobs),
             "completed_jobs": len(self.sim.completed_jobs),
+            "reward_components": {k: float(v) for k, v in reward_components.items() if not k.startswith("_")},
+            "_reward_debug": {k: float(v) for k, v in reward_components.items() if k.startswith("_")},
         }
         return obs, reward, terminated, truncated, info
 

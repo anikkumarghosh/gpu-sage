@@ -13,3 +13,12 @@ workload:
   max_duration: 200
   min_priority: 1
   max_priority: 5
+
+reward:
+  throughput: 2.0
+  waiting: 0.02
+  utilization: 0.25
+  fragmentation: 0.25
+  invalid: 1.0
+  idle: 0.01
+  waiting_normalization: sum

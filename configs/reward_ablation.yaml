@@ -1,0 +1,10 @@
+# Controlled reward ablation — 6 configs A-F
+# See configs/rewards/ for individual files.
+# Load via: RewardConfig.from_dict or training/train_ppo.py --reward-config
+rewards:
+  A_baseline: {throughput: 2.0, waiting: 0.02, utilization: 0.25, fragmentation: 0.25, invalid: 1.0, idle: 0.01, waiting_normalization: sum}
+  B_waiting: {throughput: 2.0, waiting: 0.05, utilization: 0.25, fragmentation: 0.25, invalid: 1.0, idle: 0.01, waiting_normalization: sum}
+  C_util: {throughput: 2.0, waiting: 0.02, utilization: 0.75, fragmentation: 0.25, invalid: 1.0, idle: 0.01, waiting_normalization: sum}
+  D_frag: {throughput: 2.0, waiting: 0.02, utilization: 0.25, fragmentation: 0.75, invalid: 1.0, idle: 0.01, waiting_normalization: sum}
+  E_throughput: {throughput: 4.0, waiting: 0.02, utilization: 0.25, fragmentation: 0.25, invalid: 1.0, idle: 0.01, waiting_normalization: sum}
+  F_balanced: {throughput: 2.5, waiting: 0.03, utilization: 0.4, fragmentation: 0.4, invalid: 1.0, idle: 0.01, waiting_normalization: mean}

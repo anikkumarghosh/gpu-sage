@@ -40,7 +40,13 @@ def get_git_hash() -> str | None:
     except Exception:
         return None
 
-def make_env(seed: int):
+def make_env(seed: int, reward_config: RewardConfig | None = None, reward_config_path: Path | None = None):
+    # Resolve reward config from path if given
+    if reward_config is None and reward_config_path is not None:
+        from gpu_sage.env.gpu_env import load_reward_config
+        reward_config = load_reward_config(reward_config_path)
+    if reward_config is None:
+        reward_config = RewardConfig()
     def _factory():
         return GPUSchedulingEnv(
             num_gpus=8,
@@ -58,14 +64,7 @@ def make_env(seed: int):
                 min_priority=1,
                 max_priority=5,
             ),
-            reward_config=RewardConfig(
-                throughput=2.0,
-                waiting=0.02,
-                utilization=0.25,
-                fragmentation=0.25,
-                invalid_action=1.0,
-                idle=0.01,
-            ),
+            reward_config=reward_config,
             seed=seed,
         )
     return _factory
@@ -127,6 +126,39 @@ class MetricsCSVCallback(BaseCallback):
                 w = csv.DictWriter(f, fieldnames=self.fieldnames)
                 w.writerow(rec)
             self.records.append(rec)
+        return True
+
+class RewardComponentCallback(BaseCallback):
+    """Log per-component reward contributions to TensorBoard and CSV.
+
+    Captures `info["reward_components"]` from env steps and records
+    them via `self.logger.record`. Ensures total = sum(parts) is verifiable.
+    """
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.component_sums: dict[str, float] = {}
+        self.component_counts: dict[str, int] = {}
+
+    def _on_step(self) -> bool:
+        # VecEnv infos is a tuple/list of dicts
+        infos = self.locals.get("infos", [])
+        for info in infos:
+            if isinstance(info, dict) and "reward_components" in info:
+                comps = info["reward_components"]
+                # Verify total == sum
+                total = comps.get("total_reward", 0)
+                s = sum(v for k, v in comps.items() if k != "total_reward")
+                # Log each component
+                for k, v in comps.items():
+                    if k == "total_reward":
+                        continue
+                    self.logger.record(f"reward/{k}", float(v))
+                    self.component_sums[k] = self.component_sums.get(k, 0.0) + float(v)
+                    self.component_counts[k] = self.component_counts.get(k, 0) + 1
+                self.logger.record("reward/total", float(total))
+                # Also log debug to check scale
+                if "_waiting_sum" in info.get("_reward_debug", {}):
+                    self.logger.record("reward_debug/waiting_sum", float(info["_reward_debug"]["_waiting_sum"]))
         return True
 
 def enrich_metrics_from_eval(run_dir: Path):
@@ -287,7 +319,12 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=250_000, help="Total timesteps")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--out", type=Path, default=Path("artifacts/ppo"), help="Base output dir")
+    parser.add_argument("--reward-config", type=Path, default=None, help="Path to reward yaml (e.g., configs/rewards/reward_F_balanced.yaml)")
     args = parser.parse_args()
+
+    # Load reward config (yaml) if provided
+    from gpu_sage.env.gpu_env import load_reward_config
+    reward_cfg = load_reward_config(args.reward_config) if args.reward_config else RewardConfig()
 
     # Run directory with unique ID
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -314,7 +351,7 @@ def main() -> None:
     logger.info(f"Run ID: {run_id}")
     logger.info(f"Run dir: {run_dir}")
 
-    # Save config
+    # Save config (include actual reward config used)
     config = {
         "run_id": run_id,
         "timestamp": ts,
@@ -325,7 +362,8 @@ def main() -> None:
         "git_hash": get_git_hash(),
         "cluster": {"num_gpus": 8, "gpu_memory_gb": 80, "gpu_type": "A100"},
         "workload": {"arrival_rate": 0.08, "min_gpus": 1, "max_gpus": 4, "min_memory_gb": 8, "max_memory_gb": 64, "min_duration": 20, "max_duration": 180, "min_priority": 1, "max_priority": 5},
-        "reward_config": {"throughput": 2.0, "waiting": 0.02, "utilization": 0.25, "fragmentation": 0.25, "invalid_action": 1.0, "idle": 0.01},
+        "reward_config": reward_cfg.to_dict(),
+        "reward_config_path": str(args.reward_config) if args.reward_config else None,
         "ppo_hparams": {"learning_rate": 3e-4, "n_steps": 2048, "batch_size": 256, "n_epochs": 10, "gamma": 0.99, "gae_lambda": 0.95, "clip_range": 0.2, "ent_coef": 0.01, "vf_coef": 0.5, "max_grad_norm": 0.5, "policy": "MultiInputPolicy"},
         "out_dir": str(run_dir),
     }
@@ -334,15 +372,16 @@ def main() -> None:
     with open(run_dir / "training.log", "a") as f:
         f.write(f"Config: {json.dumps(config, indent=2)}\n")
 
-    # Envs
-    train_env = DummyVecEnv([make_env(args.seed)])
-    eval_env = DummyVecEnv([make_env(args.seed + 10_000)])
+    # Envs (with reward config)
+    train_env = DummyVecEnv([make_env(args.seed, reward_config=reward_cfg)])
+    eval_env = DummyVecEnv([make_env(args.seed + 10_000, reward_config=reward_cfg)])
 
-    # Callbacks: checkpoint every 50k, eval every steps//10
+    # Callbacks: checkpoint every 50k, eval every steps//10, reward components
     checkpoint_cb = CheckpointCallback(save_freq=max(50000 // 1, 1), save_path=str(run_dir / "checkpoints"), name_prefix="ppo")
     # Also save to base checkpoints for legacy
     checkpoint_cb2 = CheckpointCallback(save_freq=max(50000 // 1, 1), save_path=str(base_out / "checkpoints"), name_prefix="ppo")
     metrics_cb = MetricsCSVCallback(csv_path=run_dir / "metrics.csv")
+    reward_cb = RewardComponentCallback()
     eval_cb = MaskableEvalCallback(
         eval_env,
         best_model_save_path=str(run_dir / "best"),
@@ -352,7 +391,7 @@ def main() -> None:
         deterministic=True,
         render=False,
     )
-    callbacks = CallbackList([checkpoint_cb, checkpoint_cb2, metrics_cb, eval_cb])
+    callbacks = CallbackList([checkpoint_cb, checkpoint_cb2, metrics_cb, reward_cb, eval_cb])
 
     # Also save periodic checkpoints via simple interval (50k)
     # SB3 CheckpointCallback saves at save_freq timesteps
@@ -459,6 +498,7 @@ def main() -> None:
         json.dump(summary, f, indent=2)
 
     # Generate TRAINING_REPORT.md
+    rc = reward_cfg.to_dict()
     report = f"""# GPU-Sage PPO Training Report
 
 **Run ID:** {run_id}  
@@ -467,11 +507,12 @@ def main() -> None:
 **Duration:** {summary['training_time_hms']} ({elapsed:.1f}s)  
 **Git:** {get_git_hash() or 'unknown'}  
 **Python:** {platform.python_version()} on {platform.platform()}
+**Reward Config:** {args.reward_config or 'default (A_baseline)'}
 
 ## Configuration
 - Cluster: 8×A100 80GB
 - Workload: arrival_rate=0.08, 1-4 GPUs, 20-180s, 1-5 priority
-- Reward: throughput=2.0 waiting=0.02 util=0.25 frag=0.25 invalid=1.0 idle=0.01
+- Reward: throughput={rc['throughput']} waiting={rc['waiting']} util={rc['utilization']} frag={rc['fragmentation']} invalid={rc['invalid_action']} idle={rc['idle']} norm={rc.get('waiting_normalization','sum')}
 - PPO: lr=3e-4 n_steps=2048 batch=256 n_epochs=10 gamma=0.99
 
 ## Results

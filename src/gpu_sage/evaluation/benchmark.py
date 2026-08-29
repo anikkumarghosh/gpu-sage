@@ -111,6 +111,7 @@ def evaluate_ppo_fixed_workload(
     gpu_memory_gb: float = 80.0,
     max_jobs: int = 16,
     workload_config=None,
+    reward_config=None,
     seed: int = 0,
 ) -> tuple[Metrics, list[dict], list[dict], dict]:
     """Evaluate PPO on a fixed workload via env loop (deterministic).
@@ -149,6 +150,7 @@ def evaluate_ppo_fixed_workload(
         max_jobs=max_jobs,
         episode_jobs=len(jobs),
         workload_config=workload_config,
+        reward_config=reward_config,
         seed=seed,
     )
 
@@ -247,6 +249,8 @@ def evaluate_ppo_fixed_workload(
             if action != env.noop_action:
                 scheduling_decisions += 1
 
+        # Include reward components if available
+        comps = info_next.get("reward_components", {})
         decision_logs.append(
             {
                 "step": steps,
@@ -257,6 +261,12 @@ def evaluate_ppo_fixed_workload(
                 "action": int(action),
                 "selected_job_id": sel_job_id,
                 "reward": float(reward),
+                "throughput_reward": float(comps.get("throughput_reward", 0)),
+                "waiting_penalty": float(comps.get("waiting_penalty", 0)),
+                "utilization_reward": float(comps.get("utilization_reward", 0)),
+                "fragmentation_penalty": float(comps.get("fragmentation_penalty", 0)),
+                "idle_penalty": float(comps.get("idle_penalty", 0)),
+                "invalid_penalty": float(comps.get("invalid_penalty", 0)),
                 "invalid_action": bool(info_next.get("invalid_action", False)),
                 "waiting_jobs": int(info_next.get("waiting_jobs", 0)),
                 "running_jobs": int(info_next.get("running_jobs", 0)),

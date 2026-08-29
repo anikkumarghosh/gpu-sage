@@ -1,0 +1,12 @@
+# Reward D — Fragmentation-aware
+# Motivation: fragmentation causes unusable GPU capacity but current weight 0.25 is weak.
+# Increase frag penalty 3x to test if PPO learns to avoid stranding GPUs,
+# especially for gpu_heavy workloads.
+reward:
+  throughput: 2.0
+  waiting: 0.02
+  utilization: 0.25
+  fragmentation: 0.75
+  invalid: 1.0
+  idle: 0.01
+  waiting_normalization: sum

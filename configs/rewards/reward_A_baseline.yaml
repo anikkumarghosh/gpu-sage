@@ -1,0 +1,11 @@
+# Reward A — Current baseline (original)
+# Exact copy of the reward used for the first 250k experiment.
+# Purpose: reproducible baseline for ablation.
+reward:
+  throughput: 2.0
+  waiting: 0.02
+  utilization: 0.25
+  fragmentation: 0.25
+  invalid: 1.0
+  idle: 0.01
+  waiting_normalization: sum

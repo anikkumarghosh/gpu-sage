@@ -1,0 +1,11 @@
+# Reward E — Throughput-focused
+# Motivation: throughput reward is sparse (1 per completed job, +2). Doubling tests
+# if stronger completion incentive improves throughput and JCT at cost of waiting.
+reward:
+  throughput: 4.0
+  waiting: 0.02
+  utilization: 0.25
+  fragmentation: 0.25
+  invalid: 1.0
+  idle: 0.01
+  waiting_normalization: sum

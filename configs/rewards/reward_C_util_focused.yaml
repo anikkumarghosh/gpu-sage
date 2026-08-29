@@ -1,0 +1,12 @@
+# Reward C — Utilization-focused
+# Motivation: utilization reward is small (util*elapsed 0.25*0.8*5≈1) vs waiting ~20.
+# Increase utilization 3x to test if stronger util signal improves GPU utilization
+# and throughput without excessively increasing waiting.
+reward:
+  throughput: 2.0
+  waiting: 0.02
+  utilization: 0.75
+  fragmentation: 0.25
+  invalid: 1.0
+  idle: 0.01
+  waiting_normalization: sum

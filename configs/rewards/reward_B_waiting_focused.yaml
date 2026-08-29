@@ -1,0 +1,12 @@
+# Reward B — Waiting-focused
+# Motivation: waiting penalty dominates at scale (sum_wait ~1000 → penalty 20 vs util ~1).
+# Increase waiting weight 2.5x to test if stronger waiting signal reduces Avg Wait / P95 Wait
+# while keeping throughput meaningful.
+reward:
+  throughput: 2.0
+  waiting: 0.05
+  utilization: 0.25
+  fragmentation: 0.25
+  invalid: 1.0
+  idle: 0.01
+  waiting_normalization: sum
