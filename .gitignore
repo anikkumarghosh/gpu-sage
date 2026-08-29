@@ -14,3 +14,7 @@ checkpoints/
 artifacts/ppo/
 *.zip
 !artifacts/benchmarks/*.zip
+# Handoff doc for AI continuity — local only, do not commit
+HANDOFF.md
+AI_HANDOFF.md
+.handoff.md
