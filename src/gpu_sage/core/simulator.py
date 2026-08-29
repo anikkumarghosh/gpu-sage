@@ -75,11 +75,25 @@ class Simulator:
         self.event_queue.push(self.current_time + job.duration, COMPLETION, job.job_id)
         return job
 
-    def try_schedule_with(self, selector: Callable[[list[Job], list[Job]], Job | None]) -> list[int]:
-        """Keep launching jobs using a selector until it returns None."""
+    def try_schedule_with(self, selector: Callable[..., Job | None]) -> list[int]:
+        """Keep launching jobs using a selector until it returns None.
+
+        The selector follows the Scheduler interface:
+
+            select(waiting_jobs, feasible_jobs, cluster, current_time) -> Job|None
+
+        Backward compatibility: selectors that only accept (waiting, feasible)
+        are still supported.
+        """
         launched: list[int] = []
         while True:
-            selected = selector(list(self.waiting_jobs.values()), self.feasible_waiting_jobs())
+            waiting = list(self.waiting_jobs.values())
+            feasible = self.feasible_waiting_jobs()
+            try:
+                selected = selector(waiting, feasible, self.cluster, self.current_time)
+            except TypeError:
+                # Fallback for legacy 2-arg selectors.
+                selected = selector(waiting, feasible)  # type: ignore[call-arg]
             if selected is None:
                 break
             self.schedule_job(selected.job_id)
