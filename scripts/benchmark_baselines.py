@@ -1,57 +1,143 @@
-"""Compare classical scheduling heuristics on the same workload."""
+"""Compare classical scheduling heuristics on the same workload — rigorous benchmark.
+
+Usage:
+    python scripts/benchmark_baselines.py --scenario balanced --seeds 0 1 2 3 4 5 6 7 8 9
+    python scripts/benchmark_baselines.py --all --seeds 0 1 2 3 4 5 6 7 8 9
+    python scripts/benchmark_baselines.py --scenario gpu_heavy --seeds 0 --num-jobs 50
+
+The benchmark guarantees identical workloads per seed/scenario across all schedulers.
+Results are saved to artifacts/benchmarks/ as CSV + JSON and a comparison table
+is printed with mean ± std for multi-seed runs.
+"""
 
 from __future__ import annotations
 
+import argparse
+import sys
+from pathlib import Path
+
 import pandas as pd
 
-from gpu_sage.core.cluster import Cluster
-from gpu_sage.core.simulator import Simulator
-from gpu_sage.evaluation.metrics import compute_metrics
-from gpu_sage.schedulers.fcfs import FCFSScheduler
-from gpu_sage.schedulers.heuristics import BestFitScheduler, PriorityScheduler, SJFScheduler
-from gpu_sage.workloads.generator import SyntheticWorkload, WorkloadConfig
+from gpu_sage.evaluation.benchmark import (
+    DEFAULT_SCHEDULERS,
+    available_schedulers,
+    run_benchmark,
+    save_benchmark,
+)
+from gpu_sage.workloads.generator import SCENARIO_NAMES
 
 
-def run_policy(name, scheduler, jobs):
-    # Clone jobs so one policy cannot mutate another policy's episode.
-    from copy import deepcopy
-    local_jobs = deepcopy(jobs)
-    sim = Simulator(Cluster.homogeneous(8, memory_gb=80), scheduler)
-    sim.load_jobs(local_jobs)
-    sim.run()
-    metrics = compute_metrics(local_jobs, sim.cluster.total_gpus, sim.current_time, sim.gpu_time_used)
-    return {"scheduler": name, **metrics.as_dict()}
+def format_mean_std(mean: float, std: float, multi: bool) -> str:
+    if multi:
+        return f"{mean:.2f} +/- {std:.2f}"
+    return f"{mean:.2f}"
+
+
+def print_comparison(
+    scenario: str,
+    agg: pd.DataFrame,
+    seeds: list[int],
+) -> None:
+    multi = len(seeds) > 1
+    # Columns to display
+    # Map friendly names to metric keys
+    cols = [
+        ("Scheduler", "scheduler"),
+        ("Avg Wait", "average_waiting_time"),
+        ("P95 Wait", "p95_waiting_time"),
+        ("Avg JCT", "average_turnaround_time"),
+        ("P95 JCT", "p95_turnaround_time"),
+        ("Utilization", "gpu_utilization"),
+        ("Throughput", "throughput_jobs_per_time"),
+    ]
+    # Build display rows
+    header = " | ".join(f"{name:>14}" for name, _ in cols)
+    sep = "-+-".join("-" * 14 for _ in cols)
+    print(f"\nScenario: {scenario}  |  seeds={seeds}  |  n={len(seeds)}")
+    print(header)
+    print(sep)
+    for _, row in agg.iterrows():
+        parts = []
+        for disp, key in cols:
+            if key == "scheduler":
+                parts.append(f"{row['scheduler']:>14}")
+            else:
+                mean = row.get(f"{key}_mean", row.get(key, 0.0))
+                std = row.get(f"{key}_std", 0.0)
+                parts.append(f"{format_mean_std(mean, std, multi):>14}")
+        print(" | ".join(parts))
+    print()
 
 
 def main() -> None:
-    jobs = SyntheticWorkload(
-        WorkloadConfig(
-            arrival_rate=0.08,
-            min_gpus=1,
-            max_gpus=4,
-            min_duration=20,
-            max_duration=180,
-        ),
-        seed=7,
-    ).generate(100)
+    parser = argparse.ArgumentParser(description="Rigorous benchmark for GPU-Sage schedulers")
+    g = parser.add_mutually_exclusive_group()
+    g.add_argument("--scenario", type=str, choices=SCENARIO_NAMES, help="Single scenario to benchmark")
+    g.add_argument("--all", action="store_true", help="Benchmark all scenarios")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[0], help="List of seeds, e.g. --seeds 0 1 2 3 4")
+    parser.add_argument("--num-jobs", type=int, default=100, help="Jobs per workload")
+    parser.add_argument("--num-gpus", type=int, default=8, help="Cluster size")
+    parser.add_argument(
+        "--schedulers",
+        type=str,
+        nargs="+",
+        default=None,
+        help=f"Schedulers to compare. Available: {available_schedulers()}. Default: {DEFAULT_SCHEDULERS}",
+    )
+    parser.add_argument("--out", type=str, default="artifacts/benchmarks", help="Output directory")
+    args = parser.parse_args()
 
-    policies = [
-        ("FCFS", FCFSScheduler()),
-        ("SJF", SJFScheduler()),
-        ("Priority", PriorityScheduler()),
-        ("BestFit", BestFitScheduler()),
-    ]
-    results = pd.DataFrame([run_policy(*policy, jobs) for policy in policies])
-    cols = [
-        "scheduler",
-        "average_waiting_time",
-        "p95_waiting_time",
-        "average_turnaround_time",
-        "p95_turnaround_time",
-        "throughput_jobs_per_time",
-        "gpu_utilization",
-    ]
-    print(results[cols].to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+    # Default if neither --scenario nor --all provided: balanced for backward compat.
+    if not args.scenario and not args.all:
+        args.scenario = "balanced"
+
+    schedulers = args.schedulers if args.schedulers is not None else DEFAULT_SCHEDULERS
+    # Validate schedulers
+    avail = set(available_schedulers())
+    for s in schedulers:
+        if s not in avail:
+            parser.error(f"Unknown scheduler '{s}'. Available: {sorted(avail)}")
+
+    scenarios: list[str]
+    if args.all:
+        scenarios = SCENARIO_NAMES
+    else:
+        scenarios = [args.scenario]  # type: ignore[list-item]
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    all_aggs: list[pd.DataFrame] = []
+    for scen in scenarios:
+        results = run_benchmark(
+            scenario=scen,
+            seeds=args.seeds,
+            schedulers=schedulers,
+            num_jobs=args.num_jobs,
+            num_gpus=args.num_gpus,
+        )
+        saved = save_benchmark(scenario=scen, results=results, out_dir=out_dir)
+        agg = saved["agg_df"]  # type: ignore[typeddict-item]
+        all_aggs.append(agg)
+        print_comparison(scen, agg, args.seeds)
+        print(f"  -> saved {saved['tidy']} , {saved['agg']} , {saved['json']}")
+
+    # Summary across scenarios (if multiple)
+    if len(all_aggs) > 1:
+        summary = pd.concat(all_aggs, ignore_index=True)
+        summary_path = out_dir / "summary.csv"
+        summary.to_csv(summary_path, index=False)
+        print(f"\nSummary saved to {summary_path}")
+        # Also print a compact summary table: scenario × scheduler utilization & wait
+        print("\n=== Summary (mean utilization & avg wait across seeds) ===")
+        for scen in scenarios:
+            agg = [a for a in all_aggs if (a["scenario"] == scen).any()][0]
+            print_comparison(scen, agg, args.seeds)
+
+    # Legacy single-scenario quick print for CI / default invocation
+    if len(scenarios) == 1 and not args.all:
+        # Ensure exit code 0
+        pass
 
 
 if __name__ == "__main__":
