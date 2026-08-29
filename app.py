@@ -561,15 +561,33 @@ with left_col:
             ppo_path = None
             if st.session_state.selected_scheduler == "PPO":
                 choice = st.session_state.get("ppo_model_choice", "Homogeneous-trained (8xA100)")
+
+                def _latest_model(glob_pattern: str) -> Path | None:
+                    """Find the most recently trained final_model.zip matching a glob."""
+                    matches = sorted(
+                        Path(".").glob(glob_pattern),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    return matches[0] if matches else None
+
                 if "Heterogeneous" in choice:
-                    # Prefer hetero 250k model, fall back to hetero 5k
-                    cand = Path("artifacts/ppo_hetero/runs/20260829_224803_seed0_steps250000/model/final_model.zip")
-                    cand2 = Path("artifacts/ppo_hetero_fixed/runs/20260829_224735_seed0_steps5000/model/final_model.zip")
-                    ppo_path = str(cand if cand.exists() else cand2) if (cand.exists() or cand2.exists()) else None
+                    cand = _latest_model("artifacts/ppo_hetero*/runs/*/model/final_model.zip")
+                    ppo_path = str(cand) if cand else None
+                    if ppo_path is None:
+                        st.warning(
+                            "No heterogeneous-trained PPO model found under artifacts/ppo_hetero*/. "
+                            "Falling back to heuristic scheduler. Train one with training/train_ppo.py "
+                            "using a heterogeneous cluster config first."
+                        )
                 elif "Graph" in choice:
-                    # Graph PPO model - use the topology-sensitive graph model
-                    cand = Path("artifacts/ppo/runs/20260830_000940_seed0_steps128/model/final_model.zip")
-                    ppo_path = str(cand) if cand.exists() else None
+                    cand = _latest_model("artifacts/ppo_graph*/runs/*/model/final_model.zip")
+                    ppo_path = str(cand) if cand else None
+                    if ppo_path is None:
+                        st.warning(
+                            "No graph/topology-trained PPO model found under artifacts/ppo_graph*/. "
+                            "Falling back to heuristic scheduler."
+                        )
                 else:
                     cand = Path("artifacts/ppo/runs/20260829_184233_seed0_steps5000/model/final_model.zip")
                     ppo_path = str(cand) if cand.exists() else None
