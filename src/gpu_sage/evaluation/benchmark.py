@@ -41,7 +41,7 @@ from gpu_sage.core.cluster import Cluster
 from gpu_sage.core.simulator import Simulator
 from gpu_sage.evaluation.metrics import Metrics, compute_metrics
 from gpu_sage.schedulers.fcfs import FCFSScheduler
-from gpu_sage.schedulers.heuristics import BestFitScheduler, PriorityScheduler, SJFScheduler
+from gpu_sage.schedulers.heuristics import BestFitScheduler, PriorityScheduler, SJFScheduler, TopologyBestFitScheduler
 from gpu_sage.schedulers.rl import RandomScheduler, RLScheduler
 from gpu_sage.workloads.generator import SCENARIO_NAMES, generate_workload, get_scenario_config
 
@@ -54,6 +54,7 @@ SCHEDULER_FACTORIES: dict[str, Callable[[], object]] = {
     "SJF": lambda: SJFScheduler(),
     "Priority": lambda: PriorityScheduler(),
     "BestFit": lambda: BestFitScheduler(),
+    "TopologyBestFit": lambda: TopologyBestFitScheduler(),
     "Random": lambda: RandomScheduler(seed=0),
     "PPO": lambda: RLScheduler(),
 }
@@ -74,6 +75,56 @@ def make_scheduler(name: str):
 # ---------------------------------------------------------------------------
 # Per-job record helper — preserves full job-level data for later analysis.
 # ---------------------------------------------------------------------------
+
+def _cluster_for_scenario(scenario: str, num_gpus: int, gpu_memory_gb: float, cluster=None, cluster_config_path=None):
+    """Resolve cluster for a scenario, preserving homogeneous default.
+
+    - If cluster is supplied, use it.
+    - If cluster_config_path supplied, load heterogeneous yaml.
+    - If scenario is heterogeneous/topology_sensitive/mixed_ml, default to heterogeneous 8GPU.
+    - Else homogeneous.
+    """
+    if cluster is not None:
+        return cluster
+    if cluster_config_path is not None:
+        from pathlib import Path
+        import yaml
+
+        data = yaml.safe_load(Path(cluster_config_path).read_text()) or {}
+        c = data.get("cluster", data)
+        specs = c.get("gpus")
+        if specs:
+            from gpu_sage.core.cluster import Cluster
+            from gpu_sage.core.topology import Topology
+
+            cl = Cluster.heterogeneous(specs)
+            topo_cfg = c.get("topology", {})
+            ttype = str(topo_cfg.get("type", "two_group"))
+            if ttype == "two_group":
+                cl.topology = Topology.two_group(cl.total_gpus, group_size=int(topo_cfg.get("group_size", 4)))
+            elif ttype == "fully_connected":
+                cl.topology = Topology.fully_connected_nvlink(cl.total_gpus)
+            return cl
+    if scenario in ("heterogeneous", "topology_sensitive", "mixed_ml"):
+        # Default heterogeneous 8GPU matching configs/heterogeneous_8gpu.yaml
+        from gpu_sage.core.cluster import Cluster
+
+        return Cluster.heterogeneous(
+            [
+                {"gpu_type": "A100_80GB", "memory_gb": 80},
+                {"gpu_type": "A100_80GB", "memory_gb": 80},
+                {"gpu_type": "A100_40GB", "memory_gb": 40},
+                {"gpu_type": "A100_40GB", "memory_gb": 40},
+                {"gpu_type": "V100_32GB", "memory_gb": 32},
+                {"gpu_type": "V100_32GB", "memory_gb": 32},
+                {"gpu_type": "T4_16GB", "memory_gb": 16},
+                {"gpu_type": "T4_16GB", "memory_gb": 16},
+            ]
+        )
+    from gpu_sage.core.cluster import Cluster
+
+    return Cluster.homogeneous(num_gpus, memory_gb=gpu_memory_gb)
+
 
 def job_to_record(
     job,
@@ -97,6 +148,11 @@ def job_to_record(
         "seed": seed,
         "status": job.status.value if hasattr(job.status, "value") else str(job.status),
         "assigned_gpus": ",".join(map(str, job.assigned_gpus)) if job.assigned_gpus else "",
+        "placement_penalty": float(getattr(job, "placement_penalty", 1.0)),
+        "communication_cost": float(getattr(job, "communication_cost", 0.0)),
+        "topology_sensitive": bool(getattr(job, "topology_sensitive", False)),
+        "preferred_gpu_type": str(getattr(job, "preferred_gpu_type", "") or ""),
+        "required_gpu_type": str(getattr(job, "required_gpu_type", "") or ""),
     }
 
 
@@ -113,6 +169,9 @@ def evaluate_ppo_fixed_workload(
     workload_config=None,
     reward_config=None,
     seed: int = 0,
+    cluster=None,
+    cluster_config_path: str | Path | None = None,
+    heterogeneous_obs: bool = False,
 ) -> tuple[Metrics, list[dict], list[dict], dict]:
     """Evaluate PPO on a fixed workload via env loop (deterministic).
 
@@ -144,6 +203,54 @@ def evaluate_ppo_fixed_workload(
         except Exception:
             workload_config = None
 
+    # Resolve cluster for PPO env (heterogeneous if scenario requires it)
+    # If caller passed explicit cluster, use it; else infer from scenario.
+    ppo_cluster = cluster
+    if ppo_cluster is None and cluster_config_path is not None:
+        from pathlib import Path as _P
+
+        import yaml
+
+        data = yaml.safe_load(_P(cluster_config_path).read_text()) or {}
+        c = data.get("cluster", data)
+        specs = c.get("gpus")
+        if specs:
+            from gpu_sage.core.cluster import Cluster as _Cl
+            from gpu_sage.core.topology import Topology as _Tp
+
+            ppo_cluster = _Cl.heterogeneous(specs)
+            topo_cfg = c.get("topology", {})
+            ttype = str(topo_cfg.get("type", "two_group"))
+            if ttype == "two_group":
+                ppo_cluster.topology = _Tp.two_group(ppo_cluster.total_gpus, group_size=int(topo_cfg.get("group_size", 4)))
+            elif ttype == "fully_connected":
+                ppo_cluster.topology = _Tp.fully_connected_nvlink(ppo_cluster.total_gpus)
+    # Auto-hetero for new scenarios if no explicit cluster
+    if ppo_cluster is None and workload_config is not None:
+        # If scenario's workload suggests hetero, create hetero cluster
+        # Detect via topology_sensitive_fraction >0
+        if getattr(workload_config, "topology_sensitive_fraction", 0) > 0:
+            ppo_cluster = _cluster_for_scenario(
+                getattr(workload_config, "scenario", "") or "heterogeneous", num_gpus, gpu_memory_gb
+            )
+            # If still homogeneous but scenario is hetero-like, keep hetero
+            if ppo_cluster and len(set(g.gpu_type for g in ppo_cluster.gpus)) == 1:
+                # force heterogeneous for hetero scenarios
+                if workload_config.topology_sensitive_fraction > 0.1:
+                    from gpu_sage.core.cluster import Cluster as _Cl2
+
+                    ppo_cluster = _Cl2.heterogeneous(
+                        [
+                            {"gpu_type": "A100_80GB", "memory_gb": 80},
+                            {"gpu_type": "A100_80GB", "memory_gb": 80},
+                            {"gpu_type": "A100_40GB", "memory_gb": 40},
+                            {"gpu_type": "A100_40GB", "memory_gb": 40},
+                            {"gpu_type": "V100_32GB", "memory_gb": 32},
+                            {"gpu_type": "V100_32GB", "memory_gb": 32},
+                            {"gpu_type": "T4_16GB", "memory_gb": 16},
+                            {"gpu_type": "T4_16GB", "memory_gb": 16},
+                        ]
+                    )
     env = GPUSchedulingEnv(
         num_gpus=num_gpus,
         gpu_memory_gb=gpu_memory_gb,
@@ -152,6 +259,8 @@ def evaluate_ppo_fixed_workload(
         workload_config=workload_config,
         reward_config=reward_config,
         seed=seed,
+        cluster=ppo_cluster,
+        heterogeneous_obs=heterogeneous_obs,
     )
 
     model = None
@@ -329,6 +438,9 @@ def run_single_seed(
     gpu_memory_gb: float = 80.0,
     ppo_model_path: str | Path | None = None,
     workload_config=None,
+    cluster=None,
+    cluster_config_path: str | Path | None = None,
+    heterogeneous_obs: bool = False,
 ) -> dict[str, Metrics]:
     """Run one seed/scenario against all schedulers on the SAME workload.
 
@@ -347,6 +459,8 @@ def run_single_seed(
         except Exception:
             workload_config = None
     results: dict[str, Metrics] = {}
+    # Resolve cluster once per seed/scenario so all schedulers share same cluster+W0
+    base_cluster = _cluster_for_scenario(scenario, num_gpus, gpu_memory_gb, cluster=cluster, cluster_config_path=cluster_config_path)
     for name in schedulers:
         if name == "PPO":
             # PPO path via env — same base_jobs
@@ -357,24 +471,30 @@ def run_single_seed(
                 gpu_memory_gb=gpu_memory_gb,
                 workload_config=workload_config,
                 seed=seed,
+                cluster=base_cluster,
+                cluster_config_path=cluster_config_path,
+                heterogeneous_obs=heterogeneous_obs,
             )
             # Fix per-job scenario/seed fields already handled in metrics generation
             results[name] = metrics
         else:
             scheduler = make_scheduler(name)
             jobs_copy = copy.deepcopy(base_jobs)
-            cluster = Cluster.homogeneous(num_gpus, memory_gb=gpu_memory_gb)
-            sim = Simulator(cluster=cluster, scheduler=scheduler)
+            # Deepcopy cluster so per-scheduler runs are isolated
+            import copy as _cp
+
+            cl = _cp.deepcopy(base_cluster)
+            sim = Simulator(cluster=cl, scheduler=scheduler)
             sim.load_jobs(jobs_copy)
             sim.run()
             metrics = compute_metrics(
                 jobs_copy,
-                total_gpus=cluster.total_gpus,
+                total_gpus=cl.total_gpus,
                 simulated_time=sim.current_time,
                 gpu_time_used=sim.gpu_time_used,
                 scheduling_decisions=len(sim.completed_jobs),
                 invalid_scheduling_attempts=0,
-                per_gpu_memory_gb=gpu_memory_gb,
+                per_gpu_memory_gb=max(g.memory_gb for g in cl.gpus),
             )
             results[name] = metrics
     return results
@@ -416,6 +536,9 @@ def run_single_seed_detailed_with_logs(
     gpu_memory_gb: float = 80.0,
     ppo_model_path: str | Path | None = None,
     workload_config=None,
+    cluster=None,
+    cluster_config_path: str | Path | None = None,
+    heterogeneous_obs: bool = False,
 ) -> tuple[dict[str, Metrics], dict[str, list[dict]], dict[str, list[dict]]]:
     """Like run_single_seed but also returns per-job records and PPO decision logs.
 
@@ -435,6 +558,7 @@ def run_single_seed_detailed_with_logs(
     metrics_map: dict[str, Metrics] = {}
     per_job_map: dict[str, list[dict]] = {}
     ppo_logs: dict[str, list[dict]] = {}
+    base_cluster = _cluster_for_scenario(scenario, num_gpus, gpu_memory_gb, cluster=cluster, cluster_config_path=cluster_config_path)
     for name in schedulers:
         if name == "PPO":
             metrics, per_job_recs, decision_logs, stats = evaluate_ppo_fixed_workload(
@@ -444,6 +568,9 @@ def run_single_seed_detailed_with_logs(
                 gpu_memory_gb=gpu_memory_gb,
                 workload_config=workload_config,
                 seed=seed,
+                cluster=base_cluster,
+                cluster_config_path=cluster_config_path,
+                heterogeneous_obs=heterogeneous_obs,
             )
             # Update per-job scenario/seed correctly
             for rec in per_job_recs:
@@ -455,18 +582,20 @@ def run_single_seed_detailed_with_logs(
         else:
             scheduler = make_scheduler(name)
             jobs_copy = copy.deepcopy(base_jobs)
-            cluster = Cluster.homogeneous(num_gpus, memory_gb=gpu_memory_gb)
-            sim = Simulator(cluster=cluster, scheduler=scheduler)
+            import copy as _cp
+
+            cl = _cp.deepcopy(base_cluster)
+            sim = Simulator(cluster=cl, scheduler=scheduler)
             sim.load_jobs(jobs_copy)
             sim.run()
             metrics = compute_metrics(
                 jobs_copy,
-                total_gpus=cluster.total_gpus,
+                total_gpus=cl.total_gpus,
                 simulated_time=sim.current_time,
                 gpu_time_used=sim.gpu_time_used,
                 scheduling_decisions=len(sim.completed_jobs),
                 invalid_scheduling_attempts=0,
-                per_gpu_memory_gb=gpu_memory_gb,
+                per_gpu_memory_gb=max(g.memory_gb for g in cl.gpus),
             )
             metrics_map[name] = metrics
             per_job_map[name] = [job_to_record(j, scheduler=name, scenario=scenario, seed=seed) for j in jobs_copy]

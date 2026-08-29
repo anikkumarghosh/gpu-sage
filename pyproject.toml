@@ -13,6 +13,9 @@ dependencies = [
     "pyyaml>=6.0",
     "pandas>=2.0",
     "matplotlib>=3.8",
+    "tensorboard>=2.15",
+    "tqdm>=4.66",
+    "rich>=13.7",
 ]
 
 [project.optional-dependencies]

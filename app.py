@@ -32,8 +32,9 @@ from src.gpu_sage.evaluation.metrics import compute_metrics
 from src.gpu_sage.workloads.generator import SCENARIO_NAMES, generate_workload, get_scenario_config, WorkloadConfig
 from src.gpu_sage.core.cluster import Cluster
 from src.gpu_sage.core.simulator import Simulator
+from src.gpu_sage.core.topology import Topology
 from src.gpu_sage.schedulers.fcfs import FCFSScheduler
-from src.gpu_sage.schedulers.heuristics import BestFitScheduler, PriorityScheduler, SJFScheduler
+from src.gpu_sage.schedulers.heuristics import BestFitScheduler, PriorityScheduler, SJFScheduler, TopologyBestFitScheduler
 from src.gpu_sage.env.gpu_env import GPUSchedulingEnv
 from sb3_contrib import MaskablePPO
 
@@ -170,6 +171,49 @@ def render_ascii_frame(
     from src.gpu_sage.utils.replay import render_ascii_frame as _render
 
     return _render(gpu_states, queue, decision, utilization, completed, sim_time, width)
+
+
+def plot_topology(cluster: Cluster, highlight_gpus: list[int] | None = None):
+    """Plotly topology graph: nodes = GPUs colored by type, edges by link type."""
+    n = cluster.total_gpus
+    topo = cluster.topology
+    if topo is None:
+        # Homogeneous: show simple row of GPUs
+        fig = go.Figure()
+        for i, g in enumerate(cluster.gpus):
+            color = "#636EFA" if g.is_free else "#EF553B"
+            fig.add_trace(go.Scatter(x=[i], y=[0], mode="markers+text", marker=dict(size=30, color=color), text=f"GPU{i}<br>{g.gpu_type}", textposition="top center", name=f"GPU{i}"))
+        fig.update_layout(title="Cluster (homogeneous — no topology penalty)", showlegend=False, height=250, yaxis=dict(visible=False), xaxis=dict(title="GPU ID"))
+        return fig
+    # Heterogeneous: two-group layout
+    pos = {}
+    for i in range(n):
+        group = i // 4
+        idx = i % 4
+        pos[i] = (idx, 1 - group)  # group A y=1, group B y=0
+    fig = go.Figure()
+    # edges
+    for i in range(n):
+        for j in range(i + 1, n):
+            lt = topo.get_link_type(i, j)
+            x0, y0 = pos[i]
+            x1, y1 = pos[j]
+            color = "#00CC96" if lt == "NVLINK" else "#AB63FA"
+            width = 3 if lt == "NVLINK" else 1
+            dash = "solid" if lt == "NVLINK" else "dot"
+            fig.add_trace(go.Scatter(x=[x0, x1], y=[y0, y1], mode="lines", line=dict(color=color, width=width, dash=dash), showlegend=False, hoverinfo="text", text=f"{i}-{j}: {lt}"))
+    # nodes
+    type_colors = {"A100_80GB": "#636EFA", "A100_40GB": "#19D3F3", "V100_32GB": "#FF6692", "V100": "#FF6692", "T4_16GB": "#FFA15A", "T4": "#FFA15A", "A100": "#636EFA"}
+    for i, g in enumerate(cluster.gpus):
+        x, y = pos[i]
+        base = type_colors.get(g.gpu_type, "#636EFA")
+        # highlight if in selected set
+        is_highlight = highlight_gpus is not None and i in highlight_gpus
+        size = 40 if is_highlight else 30
+        line = dict(color="gold", width=3) if is_highlight else dict(color="white", width=1)
+        fig.add_trace(go.Scatter(x=[x], y=[y], mode="markers+text", marker=dict(size=size, color=base, line=line), text=f"GPU{i}<br>{g.gpu_type}<br>{g.memory_gb:.0f}GB", textposition="top center", name=f"GPU{i}"))
+    fig.update_layout(title="Cluster Topology (NVLink solid, PCIe dotted; gold border = selected GPUs)", height=350, showlegend=False, yaxis=dict(visible=False), xaxis=dict(title="Group position"))
+    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +450,70 @@ with left_col:
                     width=20,
                 )
                 st.code(frame, language=None, line_numbers=False)
+
+            # Cluster topology view
+            st.markdown("#### Cluster Topology View")
+            # Build cluster for current scenario (heterogeneous vs homogeneous)
+            topo_cluster = None
+            try:
+                if st.session_state.selected_scenario in ("heterogeneous", "topology_sensitive", "mixed_ml"):
+                    topo_cluster = Cluster.heterogeneous(
+                        [
+                            {"gpu_type": "A100_80GB", "memory_gb": 80},
+                            {"gpu_type": "A100_80GB", "memory_gb": 80},
+                            {"gpu_type": "A100_40GB", "memory_gb": 40},
+                            {"gpu_type": "A100_40GB", "memory_gb": 40},
+                            {"gpu_type": "V100_32GB", "memory_gb": 32},
+                            {"gpu_type": "V100_32GB", "memory_gb": 32},
+                            {"gpu_type": "T4_16GB", "memory_gb": 16},
+                            {"gpu_type": "T4_16GB", "memory_gb": 16},
+                        ]
+                    )
+                    topo_cluster.topology = Topology.two_group(8, 4)
+                else:
+                    topo_cluster = Cluster.homogeneous(num_gpus, 80, "A100")
+                # Highlight GPUs for latest PPO decision if available
+                highlight = None
+                if scheduler_name == "PPO" and "latest" in dir():
+                    try:
+                        # Find assigned GPUs for selected job from per-job records if available
+                        jobs_csv2 = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_jobs.csv")
+                        if jobs_csv2.exists():
+                            jdf2 = pd.read_csv(jobs_csv2)
+                            sel = int(latest["selected_job_id"])
+                            row = jdf2[jdf2["job_id"] == sel]
+                            if not row.empty and "assigned_gpus" in row.columns:
+                                ag = str(row.iloc[0]["assigned_gpus"])
+                                if ag:
+                                    highlight = [int(x) for x in ag.split(",") if x.strip().isdigit()]
+                    except Exception:
+                        pass
+                fig_topo = plot_topology(topo_cluster, highlight_gpus=highlight)
+                st.plotly_chart(fig_topo, use_container_width=True)
+                # Placement explanation
+                if scheduler_name == "PPO" and "latest" in dir():
+                    st.markdown("**Placement Explanation**")
+                    sel_id = int(latest["selected_job_id"])
+                    # Try to get job details
+                    try:
+                        jobs_all = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_jobs.csv")
+                        if jobs_all.exists():
+                            jdf_all = pd.read_csv(jobs_all)
+                            jrow = jdf_all[jdf_all["job_id"] == sel_id]
+                            if not jrow.empty:
+                                r = jrow.iloc[0]
+                                st.caption(f"Selected Job: #{sel_id}  GPUs={r.get('gpu_requirement','?')}  Mem={r.get('memory_requirement','?')}GB  Topology Sensitive: {r.get('topology_sensitive','?')}")
+                                st.caption(f"Assigned GPUs: {r.get('assigned_gpus','?')}  Placement Penalty: {r.get('placement_penalty','?')}  Communication Cost: {r.get('communication_cost','?')}")
+                                if highlight:
+                                    # Compute topology score for explanation
+                                    if topo_cluster and topo_cluster.topology:
+                                        cost = topo_cluster.topology.communication_cost(highlight)
+                                        pen = topo_cluster.topology.placement_penalty(highlight, bool(r.get('topology_sensitive', False)))
+                                        st.caption(f"Topology Score (comm cost): {cost:.3f}  Estimated Penalty: {pen:.2f}x")
+                    except Exception as e:
+                        st.caption(f"Placement details unavailable: {e}")
+            except Exception as e:
+                st.caption(f"Topology view unavailable: {e}")
 
 # --- RIGHT: Comparison / Charts ---
 with right_col:

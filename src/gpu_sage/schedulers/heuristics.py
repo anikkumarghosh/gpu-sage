@@ -56,6 +56,37 @@ class BestFitScheduler(Scheduler):
         return min(feasible_jobs, key=lambda j: (j.gpu_count, j.duration, j.arrival_time, j.job_id))
 
 
+class TopologyBestFitScheduler(Scheduler):
+    """Topology-aware placement heuristic.
+
+    Picks the feasible job whose *best* feasible GPU set minimizes
+    communication_cost. Among equal-cost candidates, prefers shorter duration
+    then arrival_time. The simulator still owns actual placement; this
+    scheduler only scores jobs by their cheapest feasible topology.
+    """
+
+    def select(
+        self,
+        waiting_jobs: list[Job],
+        feasible_jobs: list[Job],
+        cluster: "Cluster | None" = None,
+        current_time: float = 0.0,
+    ) -> Job | None:
+        if not feasible_jobs:
+            return None
+        if cluster is None or cluster.topology is None:
+            # Fall back to BestFit behavior if no topology
+            return min(feasible_jobs, key=lambda j: (j.gpu_count, j.duration, j.arrival_time, j.job_id))
+
+        def _score(job: Job) -> tuple:
+            best = cluster.best_feasible_set(job, strategy="compact")
+            cost = cluster.topology.communication_cost(best) if best else 9e9
+            # Prefer lower cost; tie-break by shorter, older, lower id
+            return (cost, job.duration, job.arrival_time, job.job_id)
+
+        return min(feasible_jobs, key=_score)
+
+
 class PriorityAgingScheduler(Scheduler):
     """Priority scheduling with a linear waiting-time aging term."""
 

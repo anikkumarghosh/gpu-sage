@@ -1,7 +1,16 @@
 """Generalization + robustness evaluation for PPO vs baselines.
 
 Runs already-trained PPO (A_baseline, F_balanced) and all heuristic schedulers
-across in-dist distribution and out-of-distribution workload shifts.
+across in-distribution and out-of-distribution workload shifts.
+
+Usage:
+  python scripts/generalize_ppo.py --mode all
+  python scripts/generalize_ppo.py --mode id       # in-distribution only
+  python scripts/generalize_ppo.py --mode ood       # only OOD shifts
+  python scripts/generalize_ppo.py --mode report    # generate report + plots
+
+Examples with custom model paths:
+  python scripts/generalize_ppo.py --mode all --model-a /path/to/A_baseline.zip --model-f /path/to/F_balanced.zip
 """
 
 from __future__ import annotations
@@ -14,9 +23,8 @@ from copy import deepcopy
 import numpy as np
 import pandas as pd
 
-from gpu_sage.evaluation.benchmark import run_single_seed, evaluate_ppo_fixed_workload, aggregate_results, per_seed_dataframe
+from gpu_sage.evaluation.benchmark import run_single_seed
 from gpu_sage.workloads.generator import SCENARIO_NAMES, generate_workload, get_scenario_config, WorkloadConfig
-from gpu_sage.core.models import Job
 from sb3_contrib import MaskablePPO
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -64,10 +72,10 @@ SHIFT_ID = {"name": "ID_balanced", "desc": "In-distribution (balanced)",
 
 
 # ---------------------------------------------------------------------------
-# Model paths (already-trained finalists)
+# Model paths — NO LONGER hardcoded. User supplies via --model-a/--model-f.
+# If not supplied, the script will error loudly rather than silently
+# falling back to a heuristic and falsely labeling it "PPO".
 # ---------------------------------------------------------------------------
-BEST_A = Path("artifacts/reward_ablation/full/A_baseline/runs/20260829_200441_seed1_steps250000/model/final_model.zip")
-BEST_F = Path("artifacts/reward_ablation/full/F_balanced/runs/20260829_194948_seed0_steps250000/model/final_model.zip")
 
 
 # ---------------------------------------------------------------------------
@@ -98,11 +106,22 @@ def shift_gen_kwargs(base_cfg: WorkloadConfig, gen_kwargs: dict) -> WorkloadConf
 
 def eval_shift_ppo(model_path: Path | None, shift_def: dict, seeds: list[int],
                    num_jobs: int, num_gpus: int) -> dict[int, dict]:
-    """Evaluate PPO (A_baseline or F_balanced) on one shift across seeds.
+    """Evaluate PPO on one shift across seeds.
 
     Returns dict seed -> {scheduler: Metrics}
-    Only evaluates PPO; baselines are handled separately via run_single_seed.
+
+    If model_path is None or not found, raises RuntimeError instead of
+    silently falling back to a heuristic and falsely labeling it "PPO".
     """
+    if model_path is not None and not Path(model_path).exists():
+        raise RuntimeError(
+            f"Model not found: {model_path}. "
+            "Pass --model-a/--model-f to point to trained .zip files.\n"
+            "If running from the original milestone repo, the models are at:\n"
+            "  artifacts/reward_ablation/full/A_baseline/runs/20260829_200441_seed1_steps250000/model/final_model.zip\n"
+            "  artifacts/reward_ablation/full/F_balanced/runs/20260829_194948_seed0_steps250000/model/final_model.zip"
+        )
+
     # Build custom workload config
     base_cfg = get_scenario_config(TRAINING_CONFIG["scenario"])
     cfg = shift_gen_kwargs(base_cfg, shift_def["gen_kwargs"])
@@ -165,6 +184,10 @@ def main(argv=None):
                         help="Jobs per workload (training used 16)")
     parser.add_argument("--out", type=Path, default=Path("artifacts/reward_ablation"),
                         help="Output base dir")
+    parser.add_argument("--model-a", type=Path, default=None,
+                        help="Path to A_baseline trained MaskablePPO .zip model")
+    parser.add_argument("--model-f", type=Path, default=None,
+                        help="Path to F_balanced trained MaskablePPO .zip model")
     args = parser.parse_args(argv)
 
     out_base = args.out
@@ -177,10 +200,16 @@ def main(argv=None):
           f"{TRAINING_CONFIG['min_priority']}-{TRAINING_CONFIG['max_priority']} priority, "
           f"{TRAINING_CONFIG['num_gpus']} GPUs x {TRAINING_CONFIG['gpu_memory_gb']}GB A100")
 
+    # Resolve model paths: use args if supplied, fall back to legacy defaults
+    # only if the files actually exist (so old one-liners still work if paths happen to exist)
+    model_a = args.model_a if args.model_a and Path(args.model_a).exists() else None
+    model_f = args.model_f if args.model_f and Path(args.model_f).exists() else None
+
     # ---- In-distribution (balanced) ----
     if args.mode in ["id", "all"]:
         print("\n--- In-distribution: balanced ---")
-        for label, model_path in [("A_baseline", BEST_A), ("F_balanced", BEST_F)]:
+        for label, model_path in [("A_baseline", model_a), ("F_balanced", model_f)]:
+            print(f"  evaluating {label}...")
             try:
                 res = run_single_seed(
                     scenario="balanced",
@@ -204,9 +233,12 @@ def main(argv=None):
         for shift in SHIFT_DEFS:
             print(f"\n  Shift {shift['name']}: {shift['desc']}")
             try:
-                for label, model_path in [("A_baseline", BEST_A), ("F_balanced", BEST_F)]:
-                    print(f"    evaluating {label}...")
-                    eval_shift_ppo(model_path, shift, args.seeds, args.jobs, 8)
+                for label, model_path in [("A_baseline", model_a), ("F_balanced", model_f)]:
+                    if model_path is None:
+                        print(f"    {label}: model not supplied, skipping PPO eval")
+                    else:
+                        print(f"    evaluating {label}...")
+                        eval_shift_ppo(model_path, shift, args.seeds, args.jobs, 8)
             except Exception as e:
                 print(f"    [error] {e}")
 
@@ -216,7 +248,7 @@ def main(argv=None):
         all_records = []
 
         # In-distribution balanced
-        for label in ["A_baseline", "F_balanced"]:
+        for label, model_path in [("A_baseline", model_a), ("F_balanced", model_f)]:
             for seed in args.seeds:
                 p = out_base / f"id_{label}_seed{seed}_agg.csv"
                 if p.exists():
@@ -254,7 +286,7 @@ def main(argv=None):
 
             # Summary table
             METRIC_COLS = ["average_waiting_time", "average_turnaround_time",
-               "gpu_utilization", "throughput"]
+                           "gpu_utilization", "throughput"]
 
             summary_rows = []
             for model in ["A_baseline", "F_balanced"]:
@@ -271,7 +303,7 @@ def main(argv=None):
                         else:
                             row[f"{m}_mean"] = None
                             row[f"{m}_std"] = None
-                    # Degradation vs ID for OOD shifts
+                        # Degradation vs ID for OOD shifts
                     if shift_name != "ID":
                         id_row = big[(big["model"] == model) & (big["shift"] == "ID")]
                         if not id_row.empty:

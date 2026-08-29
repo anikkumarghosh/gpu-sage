@@ -1,0 +1,65 @@
+# Heterogeneous 8-GPU cluster — simulation abstraction, not vendor claim.
+# Performance factors are relative to A100_80GB = 1.0 for topology/observation studies.
+cluster:
+  # Explicit per-GPU list; order defines IDs 0-7 and topology groups (0-3 group A, 4-7 group B)
+  gpus:
+    - gpu_type: A100_80GB
+      memory_gb: 80
+      performance_factor: 1.0
+      compute_capability: "8.0"
+    - gpu_type: A100_80GB
+      memory_gb: 80
+      performance_factor: 1.0
+      compute_capability: "8.0"
+    - gpu_type: A100_40GB
+      memory_gb: 40
+      performance_factor: 0.90
+      compute_capability: "8.0"
+    - gpu_type: A100_40GB
+      memory_gb: 40
+      performance_factor: 0.90
+      compute_capability: "8.0"
+    - gpu_type: V100_32GB
+      memory_gb: 32
+      performance_factor: 0.65
+      compute_capability: "7.0"
+    - gpu_type: V100_32GB
+      memory_gb: 32
+      performance_factor: 0.65
+      compute_capability: "7.0"
+    - gpu_type: T4_16GB
+      memory_gb: 16
+      performance_factor: 0.35
+      compute_capability: "7.5"
+    - gpu_type: T4_16GB
+      memory_gb: 16
+      performance_factor: 0.35
+      compute_capability: "7.5"
+  topology:
+    type: two_group  # NVLink inside group of 4, PCIe across groups
+    group_size: 4
+    placement_alpha: 0.6
+    placement_cap: 2.5
+
+workload:
+  # Default for heterogeneous experiments (can be overridden per scenario)
+  arrival_rate: 0.08
+  min_gpus: 1
+  max_gpus: 4
+  min_memory_gb: 8
+  max_memory_gb: 64
+  min_duration: 20
+  max_duration: 180
+  min_priority: 1
+  max_priority: 5
+  topology_sensitive_fraction: 0.15
+  preferred_type_fraction: 0.20
+
+reward:
+  throughput: 2.0
+  waiting: 0.02
+  utilization: 0.25
+  fragmentation: 0.25
+  invalid: 1.0
+  idle: 0.01
+  waiting_normalization: sum

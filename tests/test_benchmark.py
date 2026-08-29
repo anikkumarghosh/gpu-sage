@@ -56,7 +56,9 @@ def test_different_seed_gives_different_workload():
 
 def test_scenario_configs_exist():
     expected = {"balanced", "gpu_heavy", "short_jobs", "bursty", "heavy_tail", "priority_skew"}
-    assert set(SCENARIO_NAMES) == expected
+    # New heterogeneous scenarios must be present as well, but original 6 remain unchanged.
+    assert expected.issubset(set(SCENARIO_NAMES))
+    assert {"heterogeneous", "topology_sensitive", "mixed_ml"}.issubset(set(SCENARIO_NAMES))
     for scen in expected:
         cfg = get_scenario_config(scen)
         assert isinstance(cfg, WorkloadConfig)

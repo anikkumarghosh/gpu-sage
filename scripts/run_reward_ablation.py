@@ -16,7 +16,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-import os
+
+import pandas as pd
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
@@ -28,6 +29,7 @@ REWARD_CONFIGS = {
     "E_throughput": "configs/rewards/reward_E_throughput.yaml",
     "F_balanced": "configs/rewards/reward_F_balanced.yaml",
 }
+
 
 def run_cmd(cmd: list[str], env: dict | None = None):
     print(f"\n$ {' '.join(cmd)}")
@@ -41,32 +43,95 @@ def run_cmd(cmd: list[str], env: dict | None = None):
         print(f"[WARN] Command failed with {result.returncode}: {' '.join(cmd)}")
     return result.returncode
 
-def train_one(config_name: str, config_path: str, steps: int, seed: int, out_base: Path):
-    out = out_base / config_name
-    out.mkdir(parents=True, exist_ok=True)
+
+def model_already_exists(config_name: str, steps: int, seed: int, out_base: Path) -> bool:
+    """Check if a trained model already exists for this config/session.
+
+    Checks the typical output path: out_base/screening/<config>/runs/<timestamp>/
+    or out_base/full/<config>/runs/<timestamp>/model/final_model.zip
+    """
+    # Check screening path
+    scr = out_base / "screening" / config_name
+    if scr.exists():
+        runs = list(scr.rglob("*/runs/*/model/final_model.zip"))
+        if any(p.exists() for p in runs):
+            return True
+    # Check full path
+    fl = out_base / "full" / config_name
+    if fl.exists():
+        runs = list(fl.rglob("*/runs/*/model/final_model.zip"))
+        if any(p.exists() for p in runs):
+            return True
+    # Also check simple final_model.zip in runs/<timestamp>/model/
+    for base in [out_base / "screening" / config_name, out_base / "full" / config_name]:
+        if base.exists():
+            for run_dir in base.runs.glob("*") if hasattr(base, "runs") else []:
+                m = run_dir / "model" / "final_model.zip"
+                if m.exists():
+                    return True
+    return False
+
+
+def train_one(config_name: str, config_path: str, steps: int, seed: int, out_base: Path) -> Path | None:
+    """Train one reward config.
+
+    If a model already exists for this config/seed (checked via
+    model_already_exists), skip training and return the existing model path.
+    """
+    out = out_base  # will be screening or full depending on caller
+    # Check if model already exists before training
+    if model_already_exists(config_name, steps, seed, out):
+        # Find the existing model
+        # Check screening path
+        scr = out / "screening" / config_name
+        model = None
+        if scr.exists():
+            runs = list(scr.rglob("*/runs/*/model/final_model.zip"))
+            if runs:
+                model = runs[0]
+        # Check full path
+        if model is None:
+            fl = out / "full" / config_name
+            if fl.exists():
+                runs = list(fl.rglob("*/runs/*/model/final_model.zip"))
+                if runs:
+                    model = runs[0]
+        # Fallback to legacy locations
+        if model is None:
+            for legacy in [out / "models" / "final_model.zip",
+                          out / "final_model.zip"]:
+                if legacy.exists():
+                    model = legacy
+        if model is not None:
+            print(f"  [{config_name} seed {seed}] Model already exists at {model}, skipping training.")
+            return model
+
+    out_dir = out / config_name
+    out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable, "training/train_ppo.py",
         "--steps", str(steps),
         "--seed", str(seed),
         "--reward-config", config_path,
-        "--out", str(out),
+        "--out", str(out_dir),
     ]
     run_cmd(cmd)
     # Find latest run's model
-    runs = sorted((out / "runs").glob("*"), key=lambda p: p.stat().st_mtime) if (out / "runs").exists() else []
+    runs = sorted((out_dir / "runs").glob("*"), key=lambda p: p.stat().st_mtime) if (out_dir / "runs").exists() else []
     if runs:
         latest = runs[-1]
         model = latest / "model" / "final_model.zip"
         if model.exists():
             return model
     # Fallback to legacy
-    legacy = out / "models" / "final_model.zip"
+    legacy = out_dir / "models" / "final_model.zip"
     if legacy.exists():
         return legacy
-    legacy2 = out / "final_model.zip"
+    legacy2 = out_dir / "final_model.zip"
     if legacy2.exists():
         return legacy2
     return None
+
 
 def evaluate_one(model_path: Path | None, scenario: str, seeds: list[int], out_dir: Path, reward_config_path: str | None = None):
     # Use benchmark_all with optional reward config for component logging (eval reward same as train)
@@ -84,6 +149,7 @@ def evaluate_one(model_path: Path | None, scenario: str, seeds: list[int], out_d
         ppo_model_path=str(model_path) if model_path else None,
     )
     return saved
+
 
 def main():
     parser = argparse.ArgumentParser(description="Reward ablation: controlled A-F")
@@ -111,6 +177,7 @@ def main():
         print(f"\n{'='*60}\nConfig {name}: {cfg_path}\n{'='*60}")
         models = []
         for seed in args.train_seeds:
+            # Check if model already exists before training
             model = train_one(name, cfg_path, args.steps, seed, out_base)
             print(f"Trained {name} seed {seed} -> {model}")
             models.append(model)
@@ -134,7 +201,7 @@ def main():
             print(f"Evaluated {name} on {scen} -> {saved['agg']}")
         results[name] = {"model": str(eval_model) if eval_model else None, "config": cfg_path}
 
-    # Generate summary table for screening (balanced only)
+    # Generate summary table — do this after each config, not just at the end
     try:
         import pandas as pd
         summary_rows = []
@@ -153,23 +220,24 @@ def main():
             summary_path = out_base / "ablation_summary.csv"
             summary_df.to_csv(summary_path, index=False)
             print(f"\nAblation summary saved to {summary_path} ({len(summary_df)} rows)")
-
-            # Selection criterion: balanced scenario, rank by Avg JCT then Avg Wait
-            bal = summary_df[summary_df["scenario"] == "balanced"]
-            if not bal.empty:
-                # Filter PPO only for ranking
-                ppo_bal = bal[bal["scheduler"] == "PPO"]
-                if not ppo_bal.empty:
-                    ppo_bal = ppo_bal.sort_values("average_turnaround_time_mean")
-                    print("\nPPO ranking on balanced (by Avg JCT):")
-                    for _, row in ppo_bal.iterrows():
-                        print(f"  {row['reward_config']}: JCT {row['average_turnaround_time_mean']:.1f}+/-{row['average_turnaround_time_std']:.1f}, Wait {row['average_waiting_time_mean']:.1f}")
-        # Also save component analysis placeholder
-        (out_base / "README.md").write_text(f"# Reward Ablation {args.mode}\n\nSteps: {args.steps}, train seeds {args.train_seeds}, eval seeds {args.eval_seeds}\n\nConfigs: {list(REWARD_CONFIGS.keys())}\n\nSee {out_base}/<config>/eval_* for per-scenario results.\n")
+        else:
+            print("\n[warn] no aggregation data found for summary — runs may not have completed yet")
     except Exception as e:
         print(f"[summary] Failed: {e}")
 
+    # Also save a lightweight README with config summary
+    try:
+        (out_base / "README.md").write_text(
+            f"# Reward Ablation {args.mode}\n\n"
+            f"Steps: {args.steps}, train seeds {args.train_seeds}, eval seeds {args.eval_seeds}\n\n"
+            f"Configs: {list(REWARD_CONFIGS.keys())}\n\n"
+            f"See {out_base}/<config>/eval_* for per-scenario results.\n"
+        )
+    except Exception:
+        pass
+
     print(f"\nAblation {args.mode} complete. Results under {out_base}")
+
 
 if __name__ == "__main__":
     main()

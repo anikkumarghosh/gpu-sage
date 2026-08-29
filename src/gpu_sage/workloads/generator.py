@@ -31,6 +31,10 @@ class WorkloadConfig:
     # Optional heavy-tail / burst tailoring (used only by some scenarios)
     heavy_tail_fraction: float = 0.05
     heavy_tail_multiplier: float = 5.0
+    # Heterogeneous / topology-aware extensions
+    topology_sensitive_fraction: float = 0.0  # fraction of jobs with topology_sensitive=True
+    preferred_type_fraction: float = 0.0  # fraction with preferred_gpu_type set
+    heterogeneous_memory: bool = False  # if True, sample memory to align with heterogeneous GPUs
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +110,48 @@ SCENARIO_CONFIGS: dict[str, WorkloadConfig] = {
         max_duration=180.0,
         min_priority=1,
         max_priority=5,
+    ),
+    "heterogeneous": WorkloadConfig(
+        arrival_rate=0.08,
+        min_gpus=1,
+        max_gpus=4,
+        min_memory_gb=8.0,
+        max_memory_gb=64.0,
+        min_duration=20.0,
+        max_duration=180.0,
+        min_priority=1,
+        max_priority=5,
+        topology_sensitive_fraction=0.15,
+        preferred_type_fraction=0.20,
+        heterogeneous_memory=True,
+    ),
+    "topology_sensitive": WorkloadConfig(
+        arrival_rate=0.06,
+        min_gpus=2,
+        max_gpus=8,
+        min_memory_gb=16.0,
+        max_memory_gb=64.0,
+        min_duration=40.0,
+        max_duration=300.0,
+        min_priority=1,
+        max_priority=5,
+        topology_sensitive_fraction=0.60,
+        preferred_type_fraction=0.35,
+        heterogeneous_memory=True,
+    ),
+    "mixed_ml": WorkloadConfig(
+        arrival_rate=0.10,
+        min_gpus=1,
+        max_gpus=8,
+        min_memory_gb=8.0,
+        max_memory_gb=64.0,
+        min_duration=10.0,
+        max_duration=400.0,
+        min_priority=1,
+        max_priority=5,
+        topology_sensitive_fraction=0.25,
+        preferred_type_fraction=0.25,
+        heterogeneous_memory=True,
     ),
 }
 
@@ -233,18 +279,41 @@ class SyntheticWorkload:
         jobs: list[Job] = []
 
         for job_id, arrival_time in enumerate(arrivals):
-            # For heavy_tail, occasionally force large gpu_count as well? Keep as per config.
             gpu_count = self._sample_gpu_count()
-            # Clamp to valid range.
             gpu_count = max(1, gpu_count)
+            mem = float(self.rng.uniform(self.config.min_memory_gb, self.config.max_memory_gb))
+            # Heterogeneous memory hint: for heterogeneous scenarios, occasionally sample low mem for T4-friendly jobs
+            if self.config.heterogeneous_memory and self.rng.random() < 0.3:
+                mem = float(self.rng.uniform(8, 32))
+            topo_sensitive = False
+            if self.config.topology_sensitive_fraction > 0:
+                # Only multi-GPU jobs benefit from topology
+                if gpu_count >= 2 and self.rng.random() < self.config.topology_sensitive_fraction:
+                    topo_sensitive = True
+            pref_type = None
+            if self.config.preferred_type_fraction > 0 and self.rng.random() < self.config.preferred_type_fraction:
+                # Prefer A100 for larger jobs, V100/T4 for smaller — simple split
+                if mem >= 40:
+                    pref_type = "A100_80GB" if self.rng.random() < 0.6 else "A100_40GB"
+                elif mem >= 24:
+                    pref_type = "V100_32GB"
+                else:
+                    pref_type = "T4_16GB"
+                # 20% of preferred jobs are hard requirements
+                req_type = pref_type if self.rng.random() < 0.2 else None
+            else:
+                req_type = None
             jobs.append(
                 Job(
                     job_id=job_id,
                     arrival_time=float(arrival_time),
                     gpu_count=gpu_count,
-                    gpu_memory_gb=float(self.rng.uniform(self.config.min_memory_gb, self.config.max_memory_gb)),
+                    gpu_memory_gb=mem,
                     duration=self._sample_duration(),
                     priority=self._sample_priority(),
+                    topology_sensitive=topo_sensitive,
+                    preferred_gpu_type=pref_type,
+                    required_gpu_type=req_type,
                 )
             )
         return jobs

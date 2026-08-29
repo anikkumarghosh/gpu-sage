@@ -203,8 +203,56 @@ The dashboard provides:
 
 The dashboard reuses existing benchmark artifacts and evaluation framework — no retraining or simulator changes required.
 
-### Important Design Choice
+## Advanced Extension: Heterogeneous GPU + Topology-Aware Scheduling
 
-A scheduling action never manipulates GPUs directly — the **simulator owns** time, arrivals, completions, allocation/release. This lets the exact same engine evaluate heuristics and PPO under identical workloads.
+Why homogeneous is limited: real clusters mix GPU generations with different memory/compute and non-uniform interconnects; placement quality affects distributed-training efficiency.
+
+**Heterogeneous resource model** (simulation abstractions, not vendor claims):
+- `A100_80GB: mem 80, perf 1.0` | `A100_40GB: 40, 0.90` | `V100_32GB: 32, 0.65` | `T4_16GB: 16, 0.35`
+- `configs/heterogeneous_8gpu.yaml` defaults to `[80,80,40,40,32,32,16,16]` with `Topology.two_group(group_size=4)` (NVLink inside group, PCIe across).
+- Jobs may specify `required_gpu_type`, `preferred_gpu_type`, `topology_sensitive` (see `src/gpu_sage/core/models.py`).
+
+**Topology model** (`src/gpu_sage/core/topology.py`):
+```
+GPU0 — NVLink — GPU1
+ |               |
+PCIe            PCIe
+ |               |
+GPU2 — NVLink — GPU3   |   GPU4 — NVLink — GPU5  etc.
+Bandwidth: NVLink 1.0, PCIe 0.22; Latency: 0.6 / 4.5 (normalized).
+communication_cost(S) = mean_{i<j in S} latency/bandwidth / 5  in ~[0,2.7]; single GPU => 0
+placement_penalty = 1 + 0.6*communication_cost  if topology_sensitive else 1.0, capped at 2.5
+effective_runtime = base_runtime * placement_penalty
+```
+
+**Placement**: simulator owns allocation; `Cluster.best_feasible_set(strategy="compact"|"spread")` minimizes communication_cost. Schedulers only select *jobs*, simulator picks GPUs.
+
+**PPO adaptation**: `GPUSchedulingEnv` adds `heterogeneous_obs` — per-GPU `type_id`, `performance_factor`; per-job `topology_sensitive`, `preferred_type`; cluster `avg_perf`, `hetero_flag`. Action space unchanged (`select waiting job`).
+
+**Experiment design**: identical W0 per seed/scenario across `FCFS/SJF/Priority/BestFit/TopologyBestFit/PPO`; scenarios `balanced,gpu_heavy,short_jobs,bursty,heavy_tail,priority_skew` preserved, plus `heterogeneous,topology_sensitive,mixed_ml`.
+
+**Results (20 jobs, seed 0, homogeneous PPO `artifacts/ppo/runs/20260829_184233`):**
+```
+balanced (homo): FCFS 232 JCT, SJF 227, PPO 230 — competitive
+heterogeneous:   FCFS 205, SJF 173, TopologyBestFit 186, PPO 238 — PPO degrades, TopologyBestFit best
+topology_sensitive: FCFS 850, SJF 549, BestFit 718, TopologyBestFit 767, PPO 514 — PPO best, SJF close
+mixed_ml:        FCFS 315, SJF 298, PPO 300 — PPO near SOTA
+```
+Ablation (heterogeneous scenario, 20 jobs): topology-aware `avg_placement_penalty` ~1.10 vs topology-ignored (alpha 0) 1.0 — measurable signal; TopologyBestFit improves over BestFit on heterogeneous.
+
+**Train heterogeneous PPO:**
+```bash
+python training/train_ppo.py --steps 5000 --seed 0 --scenario heterogeneous --cluster-config configs/heterogeneous_8gpu.yaml --heterogeneous-obs --out artifacts/ppo_hetero
+python training/train_ppo.py --steps 250000 --seed 0 --scenario topology_sensitive --cluster-config configs/heterogeneous_8gpu.yaml --heterogeneous-obs
+```
+
+**Benchmark heterogeneous:**
+```bash
+python -c "from gpu_sage.evaluation.benchmark import run_single_seed; run_single_seed('topology_sensitive', 0, schedulers=['FCFS','SJF','BestFit','TopologyBestFit','PPO'], ppo_model_path='artifacts/ppo/model/final_model.zip', num_jobs=100)"
+```
+
+Simulator remains single source of truth; hardware numbers are simulation abstractions.
+
+### Important Design Choice
 
 A scheduling action never manipulates GPUs directly — the **simulator owns** time, arrivals, completions, allocation/release. This lets the exact same engine evaluate heuristics and PPO under identical workloads.

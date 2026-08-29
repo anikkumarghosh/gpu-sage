@@ -40,33 +40,51 @@ def get_git_hash() -> str | None:
     except Exception:
         return None
 
-def make_env(seed: int, reward_config: RewardConfig | None = None, reward_config_path: Path | None = None):
+def make_env(
+    seed: int,
+    reward_config: RewardConfig | None = None,
+    reward_config_path: Path | None = None,
+    cluster_config_path: Path | None = None,
+    scenario: str = "balanced",
+    heterogeneous_obs: bool = False,
+):
     # Resolve reward config from path if given
     if reward_config is None and reward_config_path is not None:
         from gpu_sage.env.gpu_env import load_reward_config
         reward_config = load_reward_config(reward_config_path)
     if reward_config is None:
         reward_config = RewardConfig()
+    # Resolve workload config from scenario
+    from gpu_sage.workloads.generator import get_scenario_config
+
+    try:
+        workload_cfg = get_scenario_config(scenario)
+    except Exception:
+        workload_cfg = WorkloadConfig(
+            arrival_rate=0.08,
+            min_gpus=1,
+            max_gpus=4,
+            min_memory_gb=8,
+            max_memory_gb=64,
+            min_duration=20,
+            max_duration=180,
+            min_priority=1,
+            max_priority=5,
+        )
+
     def _factory():
         return GPUSchedulingEnv(
             num_gpus=8,
             gpu_memory_gb=80.0,
             max_jobs=16,
             episode_jobs=100,
-            workload_config=WorkloadConfig(
-                arrival_rate=0.08,
-                min_gpus=1,
-                max_gpus=4,
-                min_memory_gb=8,
-                max_memory_gb=64,
-                min_duration=20,
-                max_duration=180,
-                min_priority=1,
-                max_priority=5,
-            ),
+            workload_config=workload_cfg,
             reward_config=reward_config,
             seed=seed,
+            cluster_config_path=cluster_config_path,
+            heterogeneous_obs=heterogeneous_obs,
         )
+
     return _factory
 
 def print_header(steps: int, seed: int):
@@ -320,6 +338,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--out", type=Path, default=Path("artifacts/ppo"), help="Base output dir")
     parser.add_argument("--reward-config", type=Path, default=None, help="Path to reward yaml (e.g., configs/rewards/reward_F_balanced.yaml)")
+    parser.add_argument("--cluster-config", type=Path, default=None, help="Path to cluster yaml (e.g., configs/heterogeneous_8gpu.yaml)")
+    parser.add_argument("--scenario", type=str, default="balanced", help="Workload scenario (balanced, heterogeneous, topology_sensitive, mixed_ml, etc.)")
+    parser.add_argument("--heterogeneous-obs", action="store_true", help="Enable extended heterogeneous observation (per-GPU type/perf + topology flags)")
     args = parser.parse_args()
 
     # Load reward config (yaml) if provided
@@ -351,6 +372,28 @@ def main() -> None:
     logger.info(f"Run ID: {run_id}")
     logger.info(f"Run dir: {run_dir}")
 
+    # Resolve workload/cluster strings for config record
+    from gpu_sage.workloads.generator import get_scenario_config as _get_cfg
+
+    try:
+        _wc = _get_cfg(args.scenario)
+        workload_dict = {
+            "scenario": args.scenario,
+            "arrival_rate": _wc.arrival_rate,
+            "min_gpus": _wc.min_gpus,
+            "max_gpus": _wc.max_gpus,
+            "min_memory_gb": _wc.min_memory_gb,
+            "max_memory_gb": _wc.max_memory_gb,
+            "min_duration": _wc.min_duration,
+            "max_duration": _wc.max_duration,
+            "min_priority": _wc.min_priority,
+            "max_priority": _wc.max_priority,
+        }
+    except Exception:
+        workload_dict = {"scenario": args.scenario}
+    cluster_dict = {"num_gpus": 8, "gpu_memory_gb": 80, "gpu_type": "A100"}
+    if args.cluster_config:
+        cluster_dict = {"cluster_config": str(args.cluster_config), "heterogeneous": True}
     # Save config (include actual reward config used)
     config = {
         "run_id": run_id,
@@ -360,10 +403,13 @@ def main() -> None:
         "python_version": platform.python_version(),
         "platform": platform.platform(),
         "git_hash": get_git_hash(),
-        "cluster": {"num_gpus": 8, "gpu_memory_gb": 80, "gpu_type": "A100"},
-        "workload": {"arrival_rate": 0.08, "min_gpus": 1, "max_gpus": 4, "min_memory_gb": 8, "max_memory_gb": 64, "min_duration": 20, "max_duration": 180, "min_priority": 1, "max_priority": 5},
+        "cluster": cluster_dict,
+        "workload": workload_dict,
         "reward_config": reward_cfg.to_dict(),
         "reward_config_path": str(args.reward_config) if args.reward_config else None,
+        "cluster_config_path": str(args.cluster_config) if args.cluster_config else None,
+        "heterogeneous_obs": bool(args.heterogeneous_obs),
+        "scenario": args.scenario,
         "ppo_hparams": {"learning_rate": 3e-4, "n_steps": 2048, "batch_size": 256, "n_epochs": 10, "gamma": 0.99, "gae_lambda": 0.95, "clip_range": 0.2, "ent_coef": 0.01, "vf_coef": 0.5, "max_grad_norm": 0.5, "policy": "MultiInputPolicy"},
         "out_dir": str(run_dir),
     }
@@ -372,9 +418,9 @@ def main() -> None:
     with open(run_dir / "training.log", "a") as f:
         f.write(f"Config: {json.dumps(config, indent=2)}\n")
 
-    # Envs (with reward config)
-    train_env = DummyVecEnv([make_env(args.seed, reward_config=reward_cfg)])
-    eval_env = DummyVecEnv([make_env(args.seed + 10_000, reward_config=reward_cfg)])
+    # Envs (with reward/cluster/scenario)
+    train_env = DummyVecEnv([make_env(args.seed, reward_config=reward_cfg, cluster_config_path=args.cluster_config, scenario=args.scenario, heterogeneous_obs=args.heterogeneous_obs)])
+    eval_env = DummyVecEnv([make_env(args.seed + 10_000, reward_config=reward_cfg, cluster_config_path=args.cluster_config, scenario=args.scenario, heterogeneous_obs=args.heterogeneous_obs)])
 
     # Callbacks: checkpoint every 50k, eval every steps//10, reward components
     checkpoint_cb = CheckpointCallback(save_freq=max(50000 // 1, 1), save_path=str(run_dir / "checkpoints"), name_prefix="ppo")

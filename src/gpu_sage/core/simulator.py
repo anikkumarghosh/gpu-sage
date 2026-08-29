@@ -72,7 +72,10 @@ class Simulator:
         job.start_time = self.current_time
         self.waiting_jobs.pop(job.job_id)
         self.running_jobs[job.job_id] = job
-        self.event_queue.push(self.current_time + job.duration, COMPLETION, job.job_id)
+        # Placement-aware effective runtime: base_duration * penalty for topology_sensitive jobs.
+        # For non-sensitive jobs penalty is 1.0, so behavior is identical to homogeneous.
+        effective = (job.base_duration if job.base_duration is not None else job.duration) * job.placement_penalty
+        self.event_queue.push(self.current_time + effective, COMPLETION, job.job_id)
         return job
 
     def try_schedule_with(self, selector: Callable[..., Job | None]) -> list[int]:

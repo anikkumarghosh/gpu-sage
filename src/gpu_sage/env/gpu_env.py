@@ -12,7 +12,7 @@ import numpy as np
 from gymnasium import spaces
 
 from gpu_sage.core.cluster import Cluster
-from gpu_sage.core.models import Job
+from gpu_sage.core.models import GPU, Job
 from gpu_sage.core.simulator import Simulator
 from gpu_sage.schedulers.fcfs import FCFSScheduler
 from gpu_sage.workloads.generator import SyntheticWorkload, WorkloadConfig
@@ -116,6 +116,9 @@ class GPUSchedulingEnv(gym.Env):
         workload_config: WorkloadConfig | None = None,
         reward_config: RewardConfig | None = None,
         seed: int | None = None,
+        cluster: Cluster | None = None,
+        heterogeneous_obs: bool = False,
+        cluster_config_path: str | Path | None = None,
     ) -> None:
         super().__init__()
         if max_jobs < 1:
@@ -128,16 +131,38 @@ class GPUSchedulingEnv(gym.Env):
         self.workload_config = workload_config or WorkloadConfig()
         self.reward_config = reward_config or RewardConfig()
         self._seed = seed
+        self.heterogeneous_obs = heterogeneous_obs
+        # Cluster can be supplied directly or via yaml path; else homogeneous.
+        if cluster is not None:
+            self._cluster_template = cluster
+            self.num_gpus = cluster.total_gpus
+        elif cluster_config_path is not None:
+            self._cluster_template = self._load_cluster_from_yaml(cluster_config_path)
+            self.num_gpus = self._cluster_template.total_gpus
+        else:
+            self._cluster_template = None  # will be homogeneous per episode
 
         self.action_space = spaces.Discrete(max_jobs + 1)  # final action = NOOP
-        self.observation_space = spaces.Dict(
-            {
-                "cluster": spaces.Box(0.0, 1.0, shape=(6,), dtype=np.float32),
-                "gpus": spaces.Box(0.0, 1.0, shape=(num_gpus, 3), dtype=np.float32),
-                "jobs": spaces.Box(0.0, 1.0, shape=(max_jobs, 8), dtype=np.float32),
-                "job_mask": spaces.MultiBinary(max_jobs),
-            }
-        )
+        if heterogeneous_obs:
+            # Extended: per-GPU (is_free, is_busy, mem_norm, perf_factor, type_id_norm)
+            # cluster: + avg_perf, topology_hetero flag
+            self.observation_space = spaces.Dict(
+                {
+                    "cluster": spaces.Box(0.0, 1.0, shape=(8,), dtype=np.float32),
+                    "gpus": spaces.Box(0.0, 1.0, shape=(self.num_gpus, 5), dtype=np.float32),
+                    "jobs": spaces.Box(0.0, 1.0, shape=(max_jobs, 10), dtype=np.float32),
+                    "job_mask": spaces.MultiBinary(max_jobs),
+                }
+            )
+        else:
+            self.observation_space = spaces.Dict(
+                {
+                    "cluster": spaces.Box(0.0, 1.0, shape=(6,), dtype=np.float32),
+                    "gpus": spaces.Box(0.0, 1.0, shape=(self.num_gpus, 3), dtype=np.float32),
+                    "jobs": spaces.Box(0.0, 1.0, shape=(max_jobs, 8), dtype=np.float32),
+                    "job_mask": spaces.MultiBinary(max_jobs),
+                }
+            )
 
         self.rng = np.random.default_rng(seed)
         self.sim: Simulator | None = None
@@ -184,14 +209,96 @@ class GPUSchedulingEnv(gym.Env):
         max_allocatable = max(feasible_counts)
         return float(max(0.0, 1.0 - min(max_allocatable, free) / free))
 
+    def _load_cluster_from_yaml(self, path: str | Path) -> Cluster:
+        """Load heterogeneous Cluster from yaml (see configs/heterogeneous_8gpu.yaml)."""
+        import yaml
+
+        data = yaml.safe_load(Path(path).read_text()) or {}
+        c = data.get("cluster", data)
+        gpus_spec = c.get("gpus", None)
+        if gpus_spec is None:
+            # homogeneous fallback
+            num = int(c.get("num_gpus", self.num_gpus))
+            mem = float(c.get("gpu_memory_gb", self.gpu_memory_gb))
+            gtype = str(c.get("gpu_type", "A100"))
+            return Cluster.homogeneous(num, mem, gtype)
+        # heterogeneous
+        from gpu_sage.core.topology import Topology
+
+        cluster = Cluster.heterogeneous(gpus_spec)
+        topo_cfg = c.get("topology", {})
+        ttype = str(topo_cfg.get("type", "two_group"))
+        if ttype == "two_group":
+            gs = int(topo_cfg.get("group_size", 4))
+            cluster.topology = Topology.two_group(cluster.total_gpus, group_size=gs)
+        elif ttype == "fully_connected":
+            cluster.topology = Topology.fully_connected_nvlink(cluster.total_gpus)
+        # placement params
+        cluster.placement_alpha = float(topo_cfg.get("placement_alpha", cluster.placement_alpha))
+        cluster.placement_cap = float(topo_cfg.get("placement_cap", cluster.placement_cap))
+        return cluster
+
+    # GPU type encoding for heterogeneous observation
+    GPU_TYPE_IDS = {"A100_80GB": 0, "A100": 0, "A100_40GB": 1, "V100_32GB": 2, "V100": 2, "T4_16GB": 3, "T4": 3}
+
     def _observation(self) -> dict[str, np.ndarray]:
         assert self.sim is not None
         candidates = self._candidate_jobs()
         self.candidate_ids = [job.job_id for job in candidates] + [None] * (self.max_jobs - len(candidates))
 
         time_norm = min(self.sim.current_time / max(1.0, self.workload_config.max_duration * 10), 1.0)
-        # Use actual job count for eval mode (fixed workload may differ from episode_jobs)
         total_jobs = len(self.jobs) if self.jobs else self.episode_jobs
+        if self.heterogeneous_obs:
+            # Extended cluster vector: 6 base + avg_perf + heterogeneity_flag
+            avg_perf = float(np.mean([g.performance_factor for g in self.sim.cluster.gpus])) if self.sim.cluster.gpus else 1.0
+            # heterogeneity flag: 1 if cluster has >1 gpu_type
+            uniq_types = len(set(g.gpu_type for g in self.sim.cluster.gpus))
+            hetero_flag = 1.0 if uniq_types > 1 else 0.0
+            cluster = np.array(
+                [
+                    time_norm,
+                    self.sim.cluster.free_gpu_count / self.num_gpus,
+                    self.sim.cluster.utilization(self.sim.running_jobs),
+                    min(len(self.sim.waiting_jobs) / max(self.max_jobs, 1), 1.0),
+                    min(len(self.sim.running_jobs) / self.num_gpus, 1.0),
+                    min(len(self.sim.completed_jobs) / max(total_jobs, 1), 1.0),
+                    min(avg_perf / 1.0, 1.0),
+                    hetero_flag,
+                ],
+                dtype=np.float32,
+            )
+            gpus = np.zeros((self.num_gpus, 5), dtype=np.float32)
+            for gpu in self.sim.cluster.gpus:
+                type_id = self.GPU_TYPE_IDS.get(gpu.gpu_type, 0) / 3.0
+                gpus[gpu.gpu_id] = [
+                    1.0 if gpu.is_free else 0.0,
+                    0.0 if gpu.is_free else 1.0,
+                    min(gpu.memory_gb / 80.0, 1.0),
+                    min(gpu.performance_factor / 1.0, 1.0),
+                    type_id,
+                ]
+            jobs = np.zeros((self.max_jobs, 10), dtype=np.float32)
+            mask = np.zeros(self.max_jobs, dtype=np.int8)
+            for idx, job in enumerate(candidates):
+                mask[idx] = 1
+                compatible = self.sim.cluster.feasible_gpu_ids(job)
+                topo_flag = 1.0 if job.topology_sensitive else 0.0
+                pref_id = self.GPU_TYPE_IDS.get(job.preferred_gpu_type, 0) / 3.0 if job.preferred_gpu_type else 0.0
+                jobs[idx] = [
+                    min(job.gpu_count / self.num_gpus, 1.0),
+                    min(job.gpu_memory_gb / 80.0, 1.0),
+                    min(job.duration / max(self.workload_config.max_duration, 1), 1.0),
+                    min(job.priority / max(self.workload_config.max_priority, 1), 1.0),
+                    min(max(0.0, self.sim.current_time - job.arrival_time) / max(self.workload_config.max_duration, 1), 1.0),
+                    1.0 if job.preemptible else 0.0,
+                    min(len(compatible) / self.num_gpus, 1.0),
+                    1.0 if self.sim.cluster.can_allocate(job) else 0.0,
+                    topo_flag,
+                    pref_id,
+                ]
+            return {"cluster": cluster, "gpus": gpus, "jobs": jobs, "job_mask": mask}
+
+        # Homogeneous path (backward compatible, 6/3/8)
         cluster = np.array(
             [
                 time_norm,
@@ -307,7 +414,20 @@ class GPUSchedulingEnv(gym.Env):
             self.jobs = deepcopy(options["workload"])
         else:
             self.jobs = self._generate_jobs()
-        self.sim = Simulator(Cluster.homogeneous(self.num_gpus, self.gpu_memory_gb), FCFSScheduler())
+        # Use templated heterogeneous cluster if supplied, else homogeneous (preserves reproducibility)
+        if self._cluster_template is not None:
+            # Deepcopy template so per-episode GPU state is isolated
+            from copy import deepcopy as _dc
+
+            cluster = Cluster(
+                gpus=[GPU(g.gpu_id, g.memory_gb, g.gpu_type, None, g.performance_factor, g.compute_capability) for g in self._cluster_template.gpus],
+                topology=self._cluster_template.topology,
+                placement_alpha=self._cluster_template.placement_alpha,
+                placement_cap=self._cluster_template.placement_cap,
+            )
+        else:
+            cluster = Cluster.homogeneous(self.num_gpus, self.gpu_memory_gb)
+        self.sim = Simulator(cluster, FCFSScheduler())
         self.sim.load_jobs(deepcopy(self.jobs))
         self.last_decision_time = 0.0
         self._episode_done = False
