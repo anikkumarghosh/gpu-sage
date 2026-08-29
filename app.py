@@ -717,19 +717,19 @@ with left_col:
             with m2:
                 st.metric("Completed Jobs", len(live["completed_jobs"]))
             with m3:
-                st.metric("Avg Wait", "—")  # Will show cumulative below if experiment mode
+                st.metric("Avg Wait", f"{metrics.average_waiting_time:.1f}s")
             with m4:
-                st.metric("P95 Wait", "—")
+                st.metric("P95 Wait", f"{metrics.p95_waiting_time:.1f}s")
 
             m5, m6, m7, m8 = st.columns(4)
             with m5:
-                st.metric("Avg JCT", "—")
+                st.metric("Avg JCT", f"{metrics.average_turnaround_time:.1f}s")
             with m6:
-                st.metric("P95 JCT", "—")
+                st.metric("P95 JCT", f"{metrics.p95_jct:.1f}s")
             with m7:
-                st.metric("Throughput", "—/s")
+                st.metric("Throughput", f"{metrics.throughput:.3f}/s")
             with m8:
-                st.metric("Fairness (Jain)", "—")  # experiment only in right column
+                st.metric("Fairness (Jain)", f"{metrics.jains_fairness_index:.2f}")
 
             # Queue display from LiveState
             st.markdown("#### Job Queue")
