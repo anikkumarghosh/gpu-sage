@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+
+# Windows OpenMP duplicate lib workaround for torch
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
@@ -52,7 +56,11 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=Path("artifacts/ppo"))
     args = parser.parse_args()
 
+    # Ensure standard artifact layout: models/, logs/, checkpoints/ + legacy paths
     args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "models").mkdir(parents=True, exist_ok=True)
+    (args.out / "logs").mkdir(parents=True, exist_ok=True)
+    (args.out / "checkpoints").mkdir(parents=True, exist_ok=True)
 
     train_env = DummyVecEnv([make_env(args.seed)])
     eval_env = DummyVecEnv([make_env(args.seed + 10_000)])
@@ -87,11 +95,15 @@ def main() -> None:
     )
 
     model.learn(total_timesteps=args.steps, callback=eval_callback, progress_bar=True)
+    # Save to both legacy and new structured locations
     model.save(args.out / "final_model")
+    model.save(args.out / "models" / "final_model")
+    # Also save a seed-specific checkpoint for reproducibility
+    model.save(args.out / "checkpoints" / f"ppo_seed{args.seed}_steps{args.steps}")
 
     train_env.close()
     eval_env.close()
-    print(f"Saved model to {args.out / 'final_model.zip'}")
+    print(f"Saved model to {args.out / 'final_model.zip'} and {args.out / 'models' / 'final_model.zip'}")
 
 
 if __name__ == "__main__":

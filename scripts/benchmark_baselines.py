@@ -80,6 +80,7 @@ def main() -> None:
         default=None,
         help=f"Schedulers to compare. Available: {available_schedulers()}. Default: {DEFAULT_SCHEDULERS}",
     )
+    parser.add_argument("--ppo-model", type=Path, default=None, help="Path to PPO model (.zip) to include PPO in comparison")
     # Support both --out and --output
     parser.add_argument("--out", "--output", dest="out", type=str, default="artifacts/benchmarks", help="Output directory")
     args = parser.parse_args()
@@ -87,11 +88,19 @@ def main() -> None:
     if not args.scenario and not args.all:
         args.scenario = "balanced"
 
-    schedulers = args.schedulers if args.schedulers is not None else DEFAULT_SCHEDULERS
+    # If --ppo-model given without explicit schedulers, auto-include PPO
+    if args.schedulers is not None:
+        schedulers = args.schedulers
+    elif args.ppo_model is not None:
+        schedulers = list(DEFAULT_SCHEDULERS) + ["PPO"]
+    else:
+        schedulers = DEFAULT_SCHEDULERS
     avail = set(available_schedulers())
     for s in schedulers:
         if s not in avail:
             parser.error(f"Unknown scheduler '{s}'. Available: {sorted(avail)}")
+    if "PPO" in schedulers and args.ppo_model is None:
+        print("[WARN] PPO requested but no --ppo-model provided; using heuristic fallback for PPO (deterministic)")
 
     scenarios: list[str]
     if args.all:
@@ -111,14 +120,17 @@ def main() -> None:
             num_jobs=args.num_jobs,
             num_gpus=args.num_gpus,
             out_dir=out_dir,
+            ppo_model_path=args.ppo_model,
         )
         agg = saved["agg_df"]  # type: ignore[typeddict-item]
         all_aggs.append(agg)
         print_comparison(scen, agg, args.seeds)
-        # Print saved paths including per-job artifacts
+        # Print saved paths including per-job artifacts and PPO logs
         base_msg = f"  -> saved {saved['tidy']} , {saved['agg']} , {saved['json']}"
         if "jobs_csv" in saved:
             base_msg += f" , {saved['jobs_csv']}"
+        if "ppo_log_csv" in saved:
+            base_msg += f" , {saved['ppo_log_csv']} (PPO decisions)"
         print(base_msg)
 
     if len(all_aggs) > 1:
