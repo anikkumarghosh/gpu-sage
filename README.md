@@ -145,6 +145,66 @@ python scripts/run_reward_ablation.py --mode full --steps 250000 --train-seeds 0
 python training/train_ppo.py --steps 250000 --seed 0 --reward-config configs/rewards/reward_F_balanced.yaml
 ```
 
+## Generalization / Robustness
+
+**Research question**: Does PPO trained on one workload distribution generalize to workload distributions that differ from its training distribution?
+
+**Training distribution** (250k PPO, seed 0): `balanced` scenario, arrival_rate=0.08, 1-4 GPUs, 20-180s duration, 1-5 priority, reward A_baseline (2.0/0.02/0.25/0.25/1.0/0.01, sum normalization), MultiInputPolicy, 8 GPUs 80GB A100.
+
+**Evaluation**: 3 evaluation seeds per scenario × 7 distributions (1 in-distribution `balanced` + 6 OOD shifts defined in `scripts/generalize_ppo.py`):
+- **ID (balanced)**: in-distribution reference point
+- **Shift A**: Higher GPU demand (min_gpus=2, max_gpus=8)
+- **Shift B**: Shorter jobs (min_duration=5, max_duration=50)
+- **Shift C**: Longer jobs (min_duration=60, max_duration=400, arrival_rate=0.05)
+- **Shift D**: Bursty arrivals (modulated rate)
+- **Shift E**: Heavy-tailed runtime (heavy_tail_fraction=0.07, multiplier=8.0)
+- **Shift F**: Priority distribution shift
+
+**Key finding**: PPO with reward **F** (normalized waiting + balanced weights) shows **better robustness** to distribution shift than A_baseline, achieving **-5.6% average JCT degradation** vs **+4.8% for A_baseline**. F_balanced particularly excels on short-job and priority-skew shifts.
+
+**Generalization score** (retention = 1 - (OOD-ID)/ID * 100%):
+- A_baseline: 95.2% performance retained
+- F_balanced: 105.6% performance retained (slight improvement under shift)
+
+**SJF remains the best overall performer** across all distributions.
+
+**Run ablation**:
+```bash
+python scripts/generalize_ppo.py --mode report
+```
+
+### Interactive Dashboard
+
+Launch the dashboard with:
+
+```bash
+streamlit run app.py
+```
+
+or from the project root:
+
+```bash
+cd gpu-sage && streamlit run app.py
+```
+
+The dashboard provides:
+
+* **Live simulation** — real-time GPU cluster visualization with PPO/FCFS/SJF/Priority/BestFit schedulers
+* **Scheduler selection** — switch between PPO (using trained model) and heuristic baselines
+* **Same-workload comparison** — fixed W0 passed identically to all schedulers for fair comparison
+* **Live metrics panel** — GPU utilization, throughput, completed jobs, average/p95 wait and JCT, fairness
+* **PPO decision panel** — latest action, selected job, GPU requirement, priority, waiting time, reward components
+* **Scheduling timeline** — ASCII/Gantt-style job lifecycle visualization
+* **Comparison charts** — 6 charts (avg wait, p95 wait, avg JCT, utilization, throughput, fairness) across scenarios
+* **OOD/generalization section** — heatmap/barchart of JCT degradation across shifts A-F
+* **Experiment page** — select scenario/metric/scheduler to update charts
+* **Training replay** — ASCII frame replay from saved PPO decision logs
+* **Export GIF** — `python scripts/export_replay.py --scenario balanced --scheduler PPO --seed 0 --output artifacts/replays/ppo_balanced.gif`
+
+The dashboard reuses existing benchmark artifacts and evaluation framework — no retraining or simulator changes required.
+
 ### Important Design Choice
+
+A scheduling action never manipulates GPUs directly — the **simulator owns** time, arrivals, completions, allocation/release. This lets the exact same engine evaluate heuristics and PPO under identical workloads.
 
 A scheduling action never manipulates GPUs directly — the **simulator owns** time, arrivals, completions, allocation/release. This lets the exact same engine evaluate heuristics and PPO under identical workloads.
