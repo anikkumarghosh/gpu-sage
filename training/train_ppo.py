@@ -341,6 +341,7 @@ def main() -> None:
     parser.add_argument("--cluster-config", type=Path, default=None, help="Path to cluster yaml (e.g., configs/heterogeneous_8gpu.yaml)")
     parser.add_argument("--scenario", type=str, default="balanced", help="Workload scenario (balanced, heterogeneous, topology_sensitive, mixed_ml, etc.)")
     parser.add_argument("--heterogeneous-obs", action="store_true", help="Enable extended heterogeneous observation (per-GPU type/perf + topology flags)")
+    parser.add_argument("--policy", type=str, default="flat", choices=["flat", "graph"], help="Policy architecture: flat MultiInputPolicy or graph-aware GNN")
     args = parser.parse_args()
 
     # Load reward config (yaml) if provided
@@ -410,7 +411,8 @@ def main() -> None:
         "cluster_config_path": str(args.cluster_config) if args.cluster_config else None,
         "heterogeneous_obs": bool(args.heterogeneous_obs),
         "scenario": args.scenario,
-        "ppo_hparams": {"learning_rate": 3e-4, "n_steps": 2048, "batch_size": 256, "n_epochs": 10, "gamma": 0.99, "gae_lambda": 0.95, "clip_range": 0.2, "ent_coef": 0.01, "vf_coef": 0.5, "max_grad_norm": 0.5, "policy": "MultiInputPolicy"},
+        "policy": args.policy,
+        "ppo_hparams": {"learning_rate": 3e-4, "n_steps": 2048, "batch_size": 256, "n_epochs": 10, "gamma": 0.99, "gae_lambda": 0.95, "clip_range": 0.2, "ent_coef": 0.01, "vf_coef": 0.5, "max_grad_norm": 0.5, "policy": "GraphMaskablePolicy" if args.policy == "graph" else "MultiInputPolicy"},
         "out_dir": str(run_dir),
     }
     with open(run_dir / "config.json", "w") as f:
@@ -454,8 +456,19 @@ def main() -> None:
     # Also save periodic checkpoints via simple interval (50k)
     # SB3 CheckpointCallback saves at save_freq timesteps
 
+    # Policy selection: flat MultiInputPolicy vs graph-aware GNN
+    if args.policy == "graph":
+        from gpu_sage.rl.graph_policy import GraphMaskablePolicy
+
+        policy = GraphMaskablePolicy
+        # Graph extractor already defaults to 128 dim, pi/vf 64,32
+        policy_kwargs = {}
+    else:
+        policy = "MultiInputPolicy"
+        policy_kwargs = {}
+
     model = MaskablePPO(
-        "MultiInputPolicy",
+        policy,
         train_env,
         learning_rate=3e-4,
         n_steps=2048,
@@ -471,6 +484,7 @@ def main() -> None:
         tensorboard_log=str(run_dir / "tensorboard"),
         seed=args.seed,
         device="auto",
+        policy_kwargs=policy_kwargs,
     )
 
     start = time.time()

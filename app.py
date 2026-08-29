@@ -27,7 +27,7 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 # Project imports (reuse existing modules — no recreation)
 # ---------------------------------------------------------------------------
-from src.gpu_sage.evaluation.benchmark import run_benchmark_detailed, aggregate_results, per_seed_dataframe
+from src.gpu_sage.evaluation.benchmark import run_benchmark_detailed, aggregate_results, per_seed_dataframe, run_single_seed_detailed_with_logs
 from src.gpu_sage.evaluation.metrics import compute_metrics
 from src.gpu_sage.workloads.generator import SCENARIO_NAMES, generate_workload, get_scenario_config, WorkloadConfig
 from src.gpu_sage.core.cluster import Cluster
@@ -51,7 +51,6 @@ LAYOUT = "wide"
 # ---------------------------------------------------------------------------
 # Helper: load once @ session state (avoid re-computation)
 # ---------------------------------------------------------------------------
-
 
 def _init_session():
     """Initialize session state with pre-loaded data."""
@@ -111,7 +110,28 @@ def _init_session():
         st.session_state.ppo_model = None
 
     if "sim_state" not in st.session_state:
-        st.session_state.sim_state = None  # dict with sim, jobs, metrics, etc.
+        st.session_state.sim_state = None  # dict with live state
+
+    if "live_state" not in st.session_state:
+        # ONE authoritative live state — single source of truth for ALL dashboard elements
+        st.session_state.live_state = {
+            "simulation_time": 0.0,
+            "gpu_count": 8,
+            "waiting_jobs": [],
+            "running_jobs": [],
+            "completed_jobs": [],
+            "selected_job": None,
+            "selected_action": None,
+            "reward_components": {
+                "throughput_reward": 0.0,
+                "waiting_penalty": 0.0,
+                "utilization_reward": 0.0,
+                "fragmentation_penalty": 0.0,
+                "idle_penalty": 0.0,
+            },
+            "current_utilization": 0.0,
+            "configured_gpu_count": 8,
+        }
 
 
 _init_session()
@@ -119,7 +139,6 @@ _init_session()
 # ---------------------------------------------------------------------------
 # Load PPO model lazily
 # ---------------------------------------------------------------------------
-
 
 @st.cache_resource(show_spinner="Loading PPO model...")
 def load_ppo_model(path: Path) -> MaskablePPO | None:
@@ -129,11 +148,9 @@ def load_ppo_model(path: Path) -> MaskablePPO | None:
         st.warning(f"Could not load PPO model: {e}")
         return None
 
-
 # ---------------------------------------------------------------------------
 # Core: run benchmark for given scenario + schedulers
 # ---------------------------------------------------------------------------
-
 
 @st.cache_data(show_spinner="Running benchmark evaluation...")
 def run_benchmark_cached(
@@ -152,11 +169,9 @@ def run_benchmark_cached(
         num_gpus=num_gpus,
     )
 
-
 # ---------------------------------------------------------------------------
 # Render ASCII frame (reuse existing utility)
 # ---------------------------------------------------------------------------
-
 
 def render_ascii_frame(
     gpu_states: list[str],
@@ -172,6 +187,9 @@ def render_ascii_frame(
 
     return _render(gpu_states, queue, decision, utilization, completed, sim_time, width)
 
+# ---------------------------------------------------------------------------
+# Plot topology graph
+# ---------------------------------------------------------------------------
 
 def plot_topology(cluster: Cluster, highlight_gpus: list[int] | None = None):
     """Plotly topology graph: nodes = GPUs colored by type, edges by link type."""
@@ -215,7 +233,252 @@ def plot_topology(cluster: Cluster, highlight_gpus: list[int] | None = None):
     fig.update_layout(title="Cluster Topology (NVLink solid, PCIe dotted; gold border = selected GPUs)", height=350, showlegend=False, yaxis=dict(visible=False), xaxis=dict(title="Group position"))
     return fig
 
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# LIVE STATE MANAGEMENT
+# ---------------------------------------------------------------------------
 
+def _build_live_state_from_simulator(
+    sim: Simulator | None = None,
+    *,
+    num_gpus: int = 8,
+    scheduler_name: str | None = None,
+    seed: int | None = None,
+    metrics_obj: object | None = None,
+) -> dict:
+    """Build the one authoritative LiveState.
+
+    Can be called two ways:
+    1. _build_live_state_from_simulator(sim, num_gpus=8) — from a Simulator instance.
+    2. _build_live_state_from_simulator(num_gpus=8, scheduler_name="PPO", seed=0, metrics_obj=metrics)
+       — from benchmark Metrics + scheduler info (no Simulator needed).
+    """
+    # --- Path A: from a Simulator instance ---
+    if sim is not None:
+        free_gpus = sim.cluster.free_gpu_count
+        total_gpus = sim.cluster.total_gpus
+        utilization = sim.cluster.utilization(sim.running_jobs) if sim.cluster.gpus else 0.0
+
+        # Gather job lists from simulator store
+        all_jobs = sim._job_store
+
+        waiting = [j for j in all_jobs.values() if j.status.name == "WAITING"]
+        running = [j for j in all_jobs.values() if j.status.name == "RUNNING"]
+        completed = [j for j in all_jobs.values() if j.status.name == "COMPLETED"]
+
+        # selected_job / selected_action come from current PPO decision if PPO scheduler
+        selected_job = None
+        selected_action = None
+        reward_components = {
+            "throughput_reward": 0.0,
+            "waiting_penalty": 0.0,
+            "utilization_reward": 0.0,
+            "fragmentation_penalty": 0.0,
+            "idle_penalty": 0.0,
+        }
+        current_utilization = utilization
+
+        if scheduler_name is not None and st.session_state.selected_scheduler == "PPO":
+            # Try to get the latest PPO decision from decision logs
+            ppo_decisions_csv = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_ppo_decisions.csv")
+            if ppo_decisions_csv.exists():
+                import pandas as pd
+                ppo_df = pd.read_csv(ppo_decisions_csv)
+                if not ppo_df.empty:
+                    latest = ppo_df.iloc[-1]
+                    sjid = int(latest.get("selected_job_id", 0))
+                    if sjid > 0 and sjid in all_jobs:
+                        selected_job = all_jobs[sjid]
+                        selected_action = sjid
+                        reward_components = {
+                            "throughput_reward": float(latest.get("throughput_reward", 0)),
+                            "waiting_penalty": float(latest.get("waiting_penalty", 0)),
+                            "utilization_reward": float(latest.get("utilization_reward", 0)),
+                            "fragmentation_penalty": float(latest.get("fragmentation_penalty", 0)),
+                            "idle_penalty": float(latest.get("idle_penalty", 0)),
+                        }
+                    else:
+                        selected_job = None
+                        selected_action = None
+                else:
+                    selected_job = None
+                    selected_action = None
+            else:
+                selected_job = None
+                selected_action = None
+        else:
+            selected_job = None
+            selected_action = None
+
+        return {
+            "simulation_time": float(sim.current_time),
+            "gpu_count": num_gpus,
+            "waiting_jobs": [j.job_id for j in waiting],
+            "running_jobs": [j.job_id for j in running],
+            "completed_jobs": [j.job_id for j in completed],
+            "selected_job": selected_job,
+            "selected_action": selected_action,
+            "reward_components": reward_components,
+            "current_utilization": current_utilization,
+            "configured_gpu_count": total_gpus,
+        }
+
+    # --- Path B: from benchmark Metrics + scheduler info (no Simulator) ---
+    # metrics_obj is the Metrics dataclass from benchmark results
+    if metrics_obj is not None and scheduler_name is not None and seed is not None:
+        import pandas as pd
+
+        # Build LiveState from the Metrics object and decision logs
+        # We extract key fields from metrics_obj and the decision log CSV
+        current_utilization = float(getattr(metrics_obj, "gpu_utilization", 0.0))
+
+        # Try to get live PPO decision info from the decision log
+        ppo_decisions_csv = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_ppo_decisions.csv")
+        selected_job = None
+        selected_action = None
+        reward_components = {
+            "throughput_reward": 0.0,
+            "waiting_penalty": 0.0,
+            "utilization_reward": 0.0,
+            "fragmentation_penalty": 0.0,
+            "idle_penalty": 0.0,
+        }
+        sim_time = 0.0
+        waiting_jobs: list[int] = []
+        running_jobs: list[int] = []
+        completed_jobs_list: list[int] = []
+
+        if ppo_decisions_csv.exists():
+            ppo_df = pd.read_csv(ppo_decisions_csv)
+            if not ppo_df.empty:
+                latest = ppo_df.iloc[-1]
+                sim_time = float(latest.get("simulation_time", 0.0))
+                sjid = int(latest.get("selected_job_id", 0))
+                if sjid > 0:
+                    selected_job_id = sjid
+                    selected_action = sjid
+                    # Get reward components from the same decision
+                    reward_components = {
+                        "throughput_reward": float(latest.get("throughput_reward", 0.0)),
+                        "waiting_penalty": float(latest.get("waiting_penalty", 0.0)),
+                        "utilization_reward": float(latest.get("utilization_reward", 0.0)),
+                        "fragmentation_penalty": float(latest.get("fragmentation_penalty", 0.0)),
+                        "idle_penalty": float(latest.get("idle_penalty", 0.0)),
+                    }
+                    # Build job lists from the decision log
+                    running_jobs = [int(latest.get("running_jobs", 0))] if latest.get("running_jobs") is not None else []
+                    completed_from_log = int(latest.get("completed_jobs", 0))
+                    # We can't reconstruct exact job IDs from the log alone,
+                    # so we'll leave selected_job as the ID and completed count below
+                else:
+                    selected_job = None
+                    selected_action = None
+            else:
+                selected_job = None
+                selected_action = None
+                sim_time = 0.0
+
+        # If no PPO decision log, use metrics-based initial state
+        if selected_job is None:
+            # Use metrics to derive basic state
+            sim_time = 0.0
+            # completed count from metrics
+            completed_jobs_list = [0]  # will be rendered as len(completed_jobs)
+            # waiting/running from scheduler behavior can't be derived without sim,
+            # so we leave them empty and let the UI show "0" / display from job CSV if needed
+
+        return {
+            "simulation_time": sim_time,
+            "gpu_count": num_gpus if num_gpus else 8,
+            "waiting_jobs": waiting_jobs,
+            "running_jobs": running_jobs,
+            "completed_jobs": completed_jobs_list,
+            "selected_job": selected_job,
+            "selected_action": selected_action,
+            "reward_components": reward_components,
+            "current_utilization": current_utilization,
+            "configured_gpu_count": num_gpus if num_gpus else 8,
+        }
+
+    # --- Fallback: initial state ---
+    return {
+        "simulation_time": 0.0,
+        "gpu_count": num_gpus if num_gpus else 8,
+        "waiting_jobs": [],
+        "running_jobs": [],
+        "completed_jobs": [],
+        "selected_job": None,
+        "selected_action": None,
+        "reward_components": {
+            "throughput_reward": 0.0,
+            "waiting_penalty": 0.0,
+            "utilization_reward": 0.0,
+            "fragmentation_penalty": 0.0,
+            "idle_penalty": 0.0,
+        },
+        "current_utilization": 0.0,
+        "configured_gpu_count": num_gpus if num_gpus else 8,
+    }
+
+
+def _initialize_live_state_from_scratch(scenario: str, num_gpus: int, scheduler_name: str) -> dict:
+    """Create initial LiveState right after Reset / initial launch.
+
+    This ensures: simulation_time=0, completed_jobs=0, queue populated from
+    initial workload, no historical values survive.
+    """
+    from src.gpu_sage.workloads.generator import generate_workload
+
+    cfg = get_scenario_config(scenario)
+    base_jobs = generate_workload(
+        scenario=scenario, seed=st.session_state.seed_selector, count=16, config=cfg
+    )
+
+    # Create a fresh simulator with the scheduler
+    from src.gpu_sage.schedulers.base import Scheduler
+    from src.gpu_sage.schedulers.fcfs import FCFSScheduler
+    from src.gpu_sage.schedulers.rl import RLScheduler
+
+    if scheduler_name == "PPO":
+        scheduler = RLScheduler()
+    else:
+        scheduler_map = {
+            "FCFS": FCFSScheduler(),
+            "SJF": None,  # will use default
+            "Priority": None,
+            "BestFit": None,
+        }
+        scheduler = scheduler_map.get(scheduler_name, FCFSScheduler())
+
+    cluster = Cluster.homogeneous(num_gpus, 80, "A100")
+    sim = Simulator(cluster, scheduler)
+    sim.load_jobs(base_jobs)
+    # Run until first decision (this is what Start does internally, but we want initial state)
+    # For initial state, just capture t=0
+    # Actually, let's just create the LiveState directly without running the sim
+    # The initial state should have: t=0, no completed, queue = all waiting
+
+    return {
+        "simulation_time": 0.0,
+        "gpu_count": num_gpus,
+        "waiting_jobs": [j.job_id for j in sim.waiting_jobs.values()],
+        "running_jobs": [j.job_id for j in sim.running_jobs.values()],
+        "completed_jobs": [],  # 0 at t=0
+        "selected_job": None,
+        "selected_action": None,
+        "reward_components": {
+            "throughput_reward": 0.0,
+            "waiting_penalty": 0.0,
+            "utilization_reward": 0.0,
+            "fragmentation_penalty": 0.0,
+            "idle_penalty": 0.0,
+        },
+        "current_utilization": 0.0,
+        "configured_gpu_count": num_gpus,
+    }
+
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Page: Dashboard — Home / Live Simulation
 # ---------------------------------------------------------------------------
@@ -225,13 +488,19 @@ st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout=LAYOUT)
 st.title(f"{PAGE_ICON}  {PAGE_TITLE}")
 st.caption("Reinforcement Learning for Adaptive GPU Cluster Scheduling")
 
+# --- Mode indicator ---
+if st.session_state.sim_state is not None and st.session_state.get("live_state", {}).get("simulation_time", 0) > 0:
+    st.success("MODE: LIVE SIMULATION")
+else:
+    st.info("MODE: EXPERIMENT RESULTS (charts below)")
+
 # --- Header ---
 with st.container():
     c1, c2, c3 = st.columns([3, 1, 1])
     with c1:
         st.markdown("### GPU-Sage")
     with c2:
-        scenario = st.select_scenario = st.selectbox(
+        st.select_scenario = st.selectbox(
             "Workload scenario",
             options=SCENARIO_NAMES,
             index=SCENARIO_NAMES.index(st.session_state.selected_scenario)
@@ -240,29 +509,31 @@ with st.container():
             key="scenario_select",
         )
     with c3:
-        st.session_state.selected_scenario = scenario
+        pass  # selected_scenario updated by selectbox above
 
     # Scheduler selector
-    scheduler = st.select_scheduler = st.selectbox(
+    st.selectbox(
         "Scheduler",
         options=st.session_state.scheduler_names,
-        index=st.session_state.scheduler_names.index(
-            st.session_state.selected_scheduler
-        )
-        if st.session_state.selected_scheduler in st.session_state.scheduler_names
-        else 0,
+        index=(
+            st.session_state.scheduler_names.index(
+                st.session_state.selected_scheduler
+            )
+            if st.session_state.selected_scheduler in st.session_state.scheduler_names
+            else 0
+        ),
         key="scheduler_select",
     )
-    st.session_state.selected_scheduler = scheduler
 
-    # PPO model selector (hom vs hetero) — only when PPO chosen
+    # PPO model selector (hom vs hetero vs graph) — only when PPO chosen
+    scheduler = st.session_state.selected_scheduler
     if scheduler == "PPO":
         if "ppo_model_choice" not in st.session_state:
             st.session_state.ppo_model_choice = "Homogeneous-trained (8xA100)"
         st.session_state.ppo_model_choice = st.selectbox(
             "PPO model",
-            options=["Homogeneous-trained (8xA100)", "Heterogeneous-trained (8-hetero)"],
-            index=0 if st.session_state.get("ppo_model_choice") == "Homogeneous-trained (8xA100)" else 1,
+            options=["Homogeneous-trained (8xA100)", "Heterogeneous-trained (8-hetero)", "Graph-trained (topology-aware)"],
+            index=0 if st.session_state.get("ppo_model_choice") == "Homogeneous-trained (8xA100)" else 1 if st.session_state.get("ppo_model_choice") == "Heterogeneous-trained (8-hetero)" else 2,
             key="ppo_model_select",
         )
 
@@ -295,6 +566,10 @@ with left_col:
                     cand = Path("artifacts/ppo_hetero/runs/20260829_224803_seed0_steps250000/model/final_model.zip")
                     cand2 = Path("artifacts/ppo_hetero_fixed/runs/20260829_224735_seed0_steps5000/model/final_model.zip")
                     ppo_path = str(cand if cand.exists() else cand2) if (cand.exists() or cand2.exists()) else None
+                elif "Graph" in choice:
+                    # Graph PPO model - use the topology-sensitive graph model
+                    cand = Path("artifacts/ppo/runs/20260830_000940_seed0_steps128/model/final_model.zip")
+                    ppo_path = str(cand) if cand.exists() else None
                 else:
                     cand = Path("artifacts/ppo/runs/20260829_184233_seed0_steps5000/model/final_model.zip")
                     ppo_path = str(cand) if cand.exists() else None
@@ -316,12 +591,24 @@ with left_col:
                     seeds=[st.session_state.seed_selector],
                 )
             st.session_state.benchmark_results = results
+            # Build the ONE authoritative LiveState from the simulator
+            # We need to extract live state from the results
+            seed = st.session_state.seed_selector
+            scheduler_name = st.session_state.selected_scheduler
+            if seed in results and scheduler_name in results[seed]:
+                metrics_obj = results[seed][scheduler_name]
+                # Build a minimal simulator state from the metrics
+                # The LiveState will use decision logs for PPO, or just show initial state for heuristics
+                live = _build_live_state_from_simulator(metrics_obj=metrics_obj, scheduler_name=scheduler_name, seed=seed, num_gpus=num_gpus)
+            else:
+                live = _initialize_live_state_from_scratch(st.session_state.selected_scenario, num_gpus, scheduler_name)
             st.session_state.sim_state = {
                 "results": results,
                 "scenario": st.session_state.selected_scenario,
                 "scheduler": st.session_state.selected_scheduler,
                 "num_gpus": num_gpus,
                 "seed": st.session_state.seed_selector,
+                "live_state": live,  # Store the authoritative live state
             }
             st.rerun()
 
@@ -335,6 +622,7 @@ with left_col:
                 # Advance one decision step
                 results = st.session_state.sim_state["results"]
                 seed = st.session_state.seed_selector
+                scheduler_name = st.session_state.selected_scheduler
                 # Re-run just the selected scheduler on the same W0
                 schedulers = [st.session_state.selected_scheduler]
                 new_results = run_benchmark_cached(
@@ -345,207 +633,342 @@ with left_col:
                     seeds=[seed],
                 )
                 st.session_state.sim_state["results"] = new_results
+                # Rebuild live state from the new results
+                live = _build_live_state_from_simulator(
+                    metrics_obj=new_results[seed][scheduler_name],
+                    scheduler_name=scheduler_name,
+                    seed=seed,
+                    num_gpus=num_gpus,
+                )
+                st.session_state.sim_state["live_state"] = live
                 st.rerun()
             else:
                 st.warning("Start simulation first")
 
     with col_btn_reset:
         if st.button("Reset", use_container_width=True):
+            # Clear ALL state - no historical values may survive
             st.session_state.sim_state = None
             st.session_state.benchmark_results = None
+            # Reset live state to initial
+            st.session_state.live_state = {
+                "simulation_time": 0.0,
+                "gpu_count": 8,
+                "waiting_jobs": [],
+                "running_jobs": [],
+                "completed_jobs": [],
+                "selected_job": None,
+                "selected_action": None,
+                "reward_components": {
+                    "throughput_reward": 0.0,
+                    "waiting_penalty": 0.0,
+                    "utilization_reward": 0.0,
+                    "fragmentation_penalty": 0.0,
+                    "idle_penalty": 0.0,
+                },
+                "current_utilization": 0.0,
+                "configured_gpu_count": 8,
+            }
             st.rerun()
 
-    # --- Display simulation results ---
+    # --- Display simulation results using LiveState ---
     if st.session_state.sim_state is not None:
         results = st.session_state.sim_state["results"]
         seed = st.session_state.seed_selector
         scheduler_name = st.session_state.selected_scheduler
+        live = st.session_state.sim_state.get("live_state", {})
 
         # Pull metrics for the selected scheduler
         if seed in results and scheduler_name in results[seed]:
             metrics = results[seed][scheduler_name]
 
-            # Live metrics cards
+            # Live metrics cards — ALL from LiveState
             m1, m2, m3, m4 = st.columns(4)
             with m1:
-                st.metric("GPU Utilization", f"{metrics.gpu_utilization:.1%}")
+                st.metric("GPU Utilization", f"{live['current_utilization']:.1%}")
             with m2:
-                st.metric("Completed Jobs", int(metrics.completed_jobs))
+                st.metric("Completed Jobs", len(live["completed_jobs"]))
             with m3:
-                st.metric("Avg Wait", f"{metrics.average_waiting_time:.1f}s")
+                st.metric("Avg Wait", "—")  # Will show cumulative below if experiment mode
             with m4:
-                st.metric("P95 Wait", f"{metrics.p95_waiting_time:.1f}s")
+                st.metric("P95 Wait", "—")
 
             m5, m6, m7, m8 = st.columns(4)
             with m5:
-                st.metric("Avg JCT", f"{metrics.average_turnaround_time:.1f}s")
+                st.metric("Avg JCT", "—")
             with m6:
-                st.metric("P95 JCT", f"{metrics.p95_turnaround_time:.1f}s")
+                st.metric("P95 JCT", "—")
             with m7:
-                st.metric("Throughput", f"{metrics.throughput:.3f}/s")
+                st.metric("Throughput", "—/s")
             with m8:
-                st.metric("Fairness (Jain)", f"{metrics.jains_fairness_index:.3f}")
+                st.metric("Fairness (Jain)", "—")  # experiment only in right column
 
-            # Per-job queue visualization
+            # Queue display from LiveState
             st.markdown("#### Job Queue")
-            # Load per-job records for this scenario+seed
-            jobs_csv = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_jobs.csv")
-            if jobs_csv.exists():
-                job_df = pd.read_csv(jobs_csv)
-                # Filter to this seed if multi-seed
-                # Show first few jobs with status
-                sample_jobs = job_df.head(12)
-                for _, row in sample_jobs.iterrows():
-                    status = row.get("status", "COMPLETED")
-                    # Determine status from metrics
-                    jct = row.get("turnaround_time", 0)
-                    wait = row.get("waiting_time", 0)
-                    gpu_req = row.get("gpu_count", 1)
+            waiting = live["waiting_jobs"]
+            running = live["running_jobs"]
+            completed = live["completed_jobs"]
 
-                    # Color-code
-                    if status == "COMPLETED":
-                        badge_color = "🟢"
-                    elif jct > 500:
-                        badge_color = "🔴"
+            st.caption(f"**Queue:** {len(waiting)} waiting  |  **Running:** {len(running)}  |  **Completed:** {len(completed)}")
+
+            # Per-job details from LiveState
+            if scheduler_name == "PPO":
+                ppo_decisions_csv = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_ppo_decisions.csv")
+                if ppo_decisions_csv.exists():
+                    import pandas as pd
+                    ppo_df = pd.read_csv(ppo_decisions_csv)
+                    if not ppo_df.empty:
+                        latest = ppo_df.iloc[-1]
+                        sjid = int(latest.get("selected_job_id", 0))
+                        running_jobs_count = int(latest.get("running_jobs", 0))
+                        completed_from_log = int(latest.get("completed_jobs", 0))
+                        sim_time_from_log = float(latest.get("simulation_time", 0))
+                        # Show jobs from the decision log
+                        st.caption(f"**Simulation Time:** {sim_time_from_log:.0f}s")
+                        st.caption(f"**Running Jobs:** {running_jobs_count}  **Completed From Log:** {completed_from_log}")
                     else:
-                        badge_color = "🟡"
-
-                    st.caption(
-                        f"{badge_color} Job **#{int(row['job_id'])}** "
-                        f"GPU={gpu_req}  Wait={wait:.0f}s  JCT={jct:.0f}s  Pri={row.get('priority','?')}"
-                    )
+                        st.caption("Simulation Time: 0s  |  Running: 0  |  Completed: 0")
+                else:
+                    st.caption("Simulation Time: 0s  |  Running: 0  |  Completed: 0")
+            else:
+                # Heuristic scheduler - show from LiveState
+                sim_time_live = live["simulation_time"]
+                st.caption(f"**Simulation Time:** {sim_time_live:.0f}s  |  Running: {len(running)}  |  Completed: {len(completed)}")
 
             # PPO decision panel (if PPO selected)
             if scheduler_name == "PPO":
-                ppo_decisions_csv = Path(
-                    f"artifacts/benchmarks/{st.session_state.selected_scenario}_ppo_decisions.csv"
-                )
-                if ppo_decisions_csv.exists():
-                    ppo_df = pd.read_csv(ppo_decisions_csv)
-                    # Show latest decision
-                    latest = ppo_df.iloc[-1]
-                    st.markdown("#### PPO Decision Panel")
+                st.markdown("#### PPO Decision Panel")
+                if live["selected_job"] is not None:
+                    sjid = live["selected_job"].job_id if live["selected_job"] else 0
+                    gr = live["selected_job"].gpu_count if live["selected_job"] else 1
+                    pri = live["selected_job"].priority if live["selected_job"] else 1
+                    wt = 0.0  # Will get from decision log
+                    free_gpus = len(live["waiting_jobs"])  # approximate
+
+                    # Get latest decision log info for display
+                    ppo_decisions_csv = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_ppo_decisions.csv")
+                    if ppo_decisions_csv.exists():
+                        ppo_df = pd.read_csv(ppo_decisions_csv)
+                        if not ppo_df.empty:
+                            latest = ppo_df.iloc[-1]
+                            sjid = int(latest.get("selected_job_id", sjid))
+                            gr = int(latest.get("gpu_count", gr))
+                            pri = int(latest.get("priority", pri))
+                            wt = float(latest.get("waiting_time", 0.0))
+                            free_gpus = int(latest.get("free_gpus", free_gpus))
+                            action = int(latest.get("action", 0))
+                            reward = float(latest.get("reward", 0.0))
+                            throughput_reward = float(latest.get("throughput_reward", 0.0))
+                            waiting_penalty = float(latest.get("waiting_penalty", 0.0))
+                            utilization_reward = float(latest.get("utilization_reward", 0.0))
+                            fragmentation_penalty = float(latest.get("fragmentation_penalty", 0.0))
+                            idle_penalty = float(latest.get("idle_penalty", 0.0))
+                        else:
+                            sjid, gr, pri, wt = 0, 1, 1, 0.0
+                            free_gpus = 0
+                            reward = 0.0
+                            throughput_reward = 0.0
+                            waiting_penalty = 0.0
+                            utilization_reward = 0.0
+                            fragmentation_penalty = 0.0
+                            idle_penalty = 0.0
+                    else:
+                        sjid, gr, pri, wt = 0, 1, 1, 0.0
+                        free_gpus = 0
+                        reward = 0.0
+                        throughput_reward = 0.0
+                        waiting_penalty = 0.0
+                        utilization_reward = 0.0
+                        fragmentation_penalty = 0.0
+                        idle_penalty = 0.0
+
                     c1, c2, c3, c4 = st.columns(4)
                     with c1:
-                        st.info(f"**Selected Job:**\n#{int(latest['selected_job_id'])}")
+                        st.info(f"**Selected Job:**\n#{int(sjid)}")
                     with c2:
-                        st.info(f"**GPU Requirement:**\n{int(latest['gpu_count'])}")
+                        st.info(f"**GPU Requirement:**\n{int(gr)}")
                     with c3:
-                        st.info(f"**Priority:**\n{int(latest['priority'])}")
+                        st.info(f"**Priority:**\n{int(pri)}")
                     with c4:
-                        st.info(f"**Waiting Time:**\n{float(latest['waiting_time']):.0f}s")
+                        st.info(f"**Waiting Time:**\n{float(wt):.0f}s")
 
-                    st.caption(f"**Available GPUs:** {int(latest['free_gpus'])}")
-                    st.caption(f"**Action:** SELECT JOB {int(latest['selected_job_id'])}")
+                    st.caption(f"**Available GPUs:** {int(free_gpus)}")
+                    st.caption(f"**Action:** SELECT JOB {int(sjid)}")
 
-                    # Reward components
+                    # Reward components from the same decision transition
                     st.markdown("**Reward Components:**")
                     r1, r2, r3 = st.columns(3)
                     with r1:
-                        st.caption(f"Throughput: {float(latest['throughput_reward']):.2f}")
+                        st.caption(f"Throughput: {float(throughput_reward):.2f}")
                     with r2:
-                        st.caption(f"Waiting: {float(latest['waiting_penalty']):.2f}")
+                        st.caption(f"Waiting: {float(waiting_penalty):.2f}")
                     with r3:
-                        st.caption(f"Utilization: {float(latest['utilization_reward']):.2f}")
+                        st.caption(f"Utilization: {float(utilization_reward):.2f}")
 
-                    # Fragmentation + idle
                     r4, r5 = st.columns(2)
                     with r4:
-                        st.caption(f"Fragmentation: {float(latest['fragmentation_penalty']):.2f}")
+                        st.caption(f"Fragmentation: {float(fragmentation_penalty):.2f}")
                     with r5:
-                        st.caption(f"Idle: {float(latest['idle_penalty']):.2f}")
+                        st.caption(f"Idle: {float(idle_penalty):.2f}")
 
-            # ASCII frame snapshot
-            st.markdown("#### ASCII Snapshot")
-            if st.session_state.sim_state is not None:
-                r = results[seed][scheduler_name]
-                # Build simple GPU states from metrics
-                util = r.gpu_utilization
-                gpu_states = [
-                    f"GPU {i}: {'█' * int(util * 20) + '░' * (20 - int(util * 20))}" for i in range(min(4, num_gpus))
-                ]
-                queue_jobs = []
-                # Try to get queue from job_df
-                if jobs_csv.exists():
-                    jdf = pd.read_csv(jobs_csv)
-                    waiting = jdf[jdf.get("completion_time", 0) == 0]
-                    for _, wrow in waiting.head(4).iterrows():
-                        queue_jobs.append(f"J{int(wrow['job_id'])}")
-                decision = f"J{int(latest['selected_job_id'])}" if scheduler_name == "PPO" and 'latest' in dir() else "NOOP"
-                frame = render_ascii_frame(
-                    gpu_states=gpu_states,
-                    queue=queue_jobs,
-                    decision=decision,
-                    utilization=util,
-                    completed=int(r.completed_jobs),
-                    sim_time=float(r.simulated_time if hasattr(r, 'simulated_time') else 0),
-                    width=20,
-                )
-                st.code(frame, language=None, line_numbers=False)
-
-            # Cluster topology view
-            st.markdown("#### Cluster Topology View")
-            # Build cluster for current scenario (heterogeneous vs homogeneous)
-            topo_cluster = None
-            try:
-                if st.session_state.selected_scenario in ("heterogeneous", "topology_sensitive", "mixed_ml"):
-                    topo_cluster = Cluster.heterogeneous(
-                        [
-                            {"gpu_type": "A100_80GB", "memory_gb": 80},
-                            {"gpu_type": "A100_80GB", "memory_gb": 80},
-                            {"gpu_type": "A100_40GB", "memory_gb": 40},
-                            {"gpu_type": "A100_40GB", "memory_gb": 40},
-                            {"gpu_type": "V100_32GB", "memory_gb": 32},
-                            {"gpu_type": "V100_32GB", "memory_gb": 32},
-                            {"gpu_type": "T4_16GB", "memory_gb": 16},
-                            {"gpu_type": "T4_16GB", "memory_gb": 16},
-                        ]
-                    )
-                    topo_cluster.topology = Topology.two_group(8, 4)
+                    # Consistency check
+                    if live["simulation_time"] == 0 and len(live["completed_jobs"]) > 0:
+                        st.warning(
+                            "State consistency: simulation_time=0 but completed_jobs>0. "
+                            "Data may be mixed from different sources."
+                        )
                 else:
-                    topo_cluster = Cluster.homogeneous(num_gpus, 80, "A100")
-                # Highlight GPUs for latest PPO decision if available
-                highlight = None
-                if scheduler_name == "PPO" and "latest" in dir():
-                    try:
-                        # Find assigned GPUs for selected job from per-job records if available
-                        jobs_csv2 = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_jobs.csv")
-                        if jobs_csv2.exists():
-                            jdf2 = pd.read_csv(jobs_csv2)
-                            sel = int(latest["selected_job_id"])
-                            row = jdf2[jdf2["job_id"] == sel]
-                            if not row.empty and "assigned_gpus" in row.columns:
-                                ag = str(row.iloc[0]["assigned_gpus"])
-                                if ag:
-                                    highlight = [int(x) for x in ag.split(",") if x.strip().isdigit()]
-                    except Exception:
-                        pass
-                fig_topo = plot_topology(topo_cluster, highlight_gpus=highlight)
-                st.plotly_chart(fig_topo, use_container_width=True)
-                # Placement explanation
-                if scheduler_name == "PPO" and "latest" in dir():
-                    st.markdown("**Placement Explanation**")
-                    sel_id = int(latest["selected_job_id"])
-                    # Try to get job details
-                    try:
-                        jobs_all = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_jobs.csv")
-                        if jobs_all.exists():
-                            jdf_all = pd.read_csv(jobs_all)
-                            jrow = jdf_all[jdf_all["job_id"] == sel_id]
-                            if not jrow.empty:
-                                r = jrow.iloc[0]
-                                st.caption(f"Selected Job: #{sel_id}  GPUs={r.get('gpu_requirement','?')}  Mem={r.get('memory_requirement','?')}GB  Topology Sensitive: {r.get('topology_sensitive','?')}")
-                                st.caption(f"Assigned GPUs: {r.get('assigned_gpus','?')}  Placement Penalty: {r.get('placement_penalty','?')}  Communication Cost: {r.get('communication_cost','?')}")
-                                if highlight:
-                                    # Compute topology score for explanation
-                                    if topo_cluster and topo_cluster.topology:
-                                        cost = topo_cluster.topology.communication_cost(highlight)
-                                        pen = topo_cluster.topology.placement_penalty(highlight, bool(r.get('topology_sensitive', False)))
-                                        st.caption(f"Topology Score (comm cost): {cost:.3f}  Estimated Penalty: {pen:.2f}x")
-                    except Exception as e:
-                        st.caption(f"Placement details unavailable: {e}")
-            except Exception as e:
-                st.caption(f"Topology view unavailable: {e}")
+                    st.info("No PPO decision at current state")
+
+            # ASCII snapshot — MUST derive from LiveState only
+            st.markdown("#### ASCII Snapshot")
+            util = live["current_utilization"]
+            n_gpus = live["configured_gpu_count"]
+            gpu_states = [
+                f"GPU {i}: {'█' * int(util * 20) + '░' * (20 - int(util * 20))}" for i in range(n_gpus)
+            ]
+            queue_jobs = []
+            decision = "NOOP"
+            sim_time = live["simulation_time"]
+            completed_count = len(live["completed_jobs"])
+
+            if scheduler_name == "PPO" and live["selected_job"] is not None:
+                ppo_decisions_csv = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_ppo_decisions.csv")
+                if ppo_decisions_csv.exists():
+                    import pandas as pd
+                    ppo_df = pd.read_csv(ppo_decisions_csv)
+                    if not ppo_df.empty:
+                        latest = ppo_df.iloc[-1]
+                        sim_time = float(latest.get("simulation_time", sim_time))
+                        decision = f"J{int(latest.get('selected_job_id', 0))}" if latest.get("selected_job_id") is not None else "NOOP"
+                        running_from_log = int(latest.get("running_jobs", 0))
+                        completed_from_log = int(latest.get("completed_jobs", 0))
+                        # Use the log's completed count but note it's from the decision
+                        completed_count = completed_from_log
+                        # Build queue from log
+                        queue_jobs = []  # will be populated below
+            # Build queue from live state
+            for jid in live["waiting_jobs"][:4]:
+                queue_jobs.append(f"J{jid}")
+
+            frame = render_ascii_frame(
+                gpu_states=gpu_states,
+                queue=queue_jobs,
+                decision=decision,
+                utilization=util,
+                completed=completed_count,
+                sim_time=sim_time,
+                width=20,
+            )
+            st.code(frame, language=None, line_numbers=False)
+        else:
+            # EXPERIMENT mode: no live simulation
+            st.code(
+                render_ascii_frame(
+                    gpu_states=[f"GPU {i}: ███████████████████░" for i in range(min(8, num_gpus))],
+                    queue=[],
+                    decision="NOOP",
+                    utilization=0.0,
+                    completed=0,
+                    sim_time=0.0,
+                    width=20,
+                ),
+                language=None,
+                line_numbers=False,
+            )
+
+        # Cluster topology view - from current state
+        st.markdown("#### Cluster Topology View")
+        try:
+            if st.session_state.selected_scenario in ("heterogeneous", "topology_sensitive", "mixed_ml"):
+                topo_cluster = Cluster.heterogeneous(
+                    [
+                        {"gpu_type": "A100_80GB", "memory_gb": 80},
+                        {"gpu_type": "A100_80GB", "memory_gb": 80},
+                        {"gpu_type": "A100_40GB", "memory_gb": 40},
+                        {"gpu_type": "A100_40GB", "memory_gb": 40},
+                        {"gpu_type": "V100_32GB", "memory_gb": 32},
+                        {"gpu_type": "V100_32GB", "memory_gb": 32},
+                        {"gpu_type": "T4_16GB", "memory_gb": 16},
+                        {"gpu_type": "T4_16GB", "memory_gb": 16},
+                    ]
+                )
+                topo_cluster.topology = Topology.two_group(8, 4)
+            else:
+                topo_cluster = Cluster.homogeneous(num_gpus, 80, "A100")
+            # Highlight GPUs for current state
+            highlight = None
+            if scheduler_name == "PPO" and live["selected_job"] is not None:
+                try:
+                    jobs_csv2 = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_jobs.csv")
+                    if jobs_csv2.exists():
+                        import pandas as pd
+                        jdf2 = pd.read_csv(jobs_csv2)
+                        sel = live["selected_job"].job_id if live["selected_job"] else 0
+                        row = jdf2[jdf2["job_id"] == sel]
+                        if not row.empty and "assigned_gpus" in row.columns:
+                            ag = str(row.iloc[0]["assigned_gpus"])
+                            if ag:
+                                highlight = [int(x) for x in ag.split(",") if x.strip().isdigit()]
+                except Exception:
+                    pass
+            fig_topo = plot_topology(topo_cluster, highlight_gpus=highlight)
+            st.plotly_chart(fig_topo, use_container_width=True)
+            # Placement explanation from current state
+            if scheduler_name == "PPO" and live["selected_job"] is not None:
+                try:
+                    jobs_all = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_jobs.csv")
+                    if jobs_all.exists():
+                        import pandas as pd
+                        jdf_all = pd.read_csv(jobs_all)
+                        sel_id = live["selected_job"].job_id if live["selected_job"] else 0
+                        jrow = jdf_all[jdf_all["job_id"] == sel_id]
+                        if not jrow.empty:
+                            r = jrow.iloc[0]
+                            st.caption(f"Selected Job: #{sel_id}  GPUs={r.get('gpu_requirement','?')}  Mem={r.get('memory_requirement','?')}GB  Topology Sensitive: {r.get('topology_sensitive','?')}")
+                            st.caption(f"Assigned GPUs: {r.get('assigned_gpus','?')}  Placement Penalty: {r.get('placement_penalty','?')}  Communication Cost: {r.get('communication_cost','?')}")
+                        else:
+                            st.caption("Placement details: job not found in current state records")
+                except Exception as e:
+                    st.caption(f"Placement details unavailable: {e}")
+            else:
+                st.caption("Placement details: PPO scheduler not selected or no selected job")
+        except Exception as e:
+            st.caption(f"Topology view unavailable: {e}")
+
+    # --- STATE CONSISTENCY DEBUG (development only) ---
+    with st.expander("State Consistency Debug", expanded=False):
+        live = st.session_state.sim_state.get("live_state", {}) if st.session_state.sim_state else {}
+        sim_time = live.get("simulation_time", "N/A")
+        completed = len(live.get("completed_jobs", []))
+        waiting = len(live.get("waiting_jobs", []))
+        running = len(live.get("running_jobs", []))
+        selected = live.get("selected_job", "N/A")
+        selected_action = live.get("selected_action", "N/A")
+        util = live.get("current_utilization", "N/A")
+        gpu_count = live.get("configured_gpu_count", "N/A")
+        print_parts = [
+            f"simulation_time: {sim_time}",
+            f"completed: {completed}",
+            f"waiting: {waiting}",
+            f"running: {running}",
+            f"selected_job: {selected}",
+            f"selected_action: {selected_action}",
+            f"utilization: {util}",
+            f"gpu_count: {gpu_count}",
+        ]
+        for p in print_parts:
+            st.text(p)
+        # Simple consistency checks
+        checks = []
+        if sim_time == 0 and completed > 0:
+            checks.append("⚠️ WARNING: simulation_time=0 but completed>0")
+        if sim_time > 0 and completed >= 0:
+            checks.append("✓ simulation_time>0 and completed>=0")
+        if gpu_count != 8:
+            checks.append(f"⚠️ GPU count={gpu_count} differs from configured 8")
+        for c in checks:
+            st.info(c)
 
 # --- RIGHT: Comparison / Charts ---
 with right_col:
@@ -630,27 +1053,27 @@ with right_col:
         )
         st.plotly_chart(fig6, use_container_width=True)
 
-    # --- OOD/Generalization section ---
-    st.markdown("---")
-    st.subheader("OOD / Generalization (from experiment)")
-    # Load the generalization summary we generated earlier
-    gen_csv = Path("artifacts/reward_ablation/generalization_summary.csv")
-    if gen_csv.exists():
-        gdf = pd.read_csv(gen_csv)
-        fig_g = px.bar(
-            gdf,
-            x="shift",
-            y="average_turnaround_time_mean",
-            color="model",
-            title="JCT vs Distribution Shift (lower is better)",
-            labels={"average_turnaround_time_mean": "Avg JCT (s)", "shift": "Distribution Shift", "model": "Model"},
-        )
-        st.plotly_chart(fig_g, use_container_width=True)
-        st.caption(
-            "A_baseline: +4.8% avg degradation vs ID; F_balanced: -5.6% avg degradation (improvement)."
-        )
-    else:
-        st.info("Run `python scripts/generalize_ppo.py --mode report` to generate generalization data.")
+        # --- OOD/Generalization section ---
+        st.markdown("---")
+        st.subheader("OOD / Generalization (from experiment)")
+        # Load the generalization summary we generated earlier
+        gen_csv = Path("artifacts/reward_ablation/generalization_summary.csv")
+        if gen_csv.exists():
+            gdf = pd.read_csv(gen_csv)
+            fig_g = px.bar(
+                gdf,
+                x="shift",
+                y="average_turnaround_time_mean",
+                color="model",
+                title="JCT vs Distribution Shift (lower is better)",
+                labels={"average_turnaround_time_mean": "Avg JCT (s)", "shift": "Distribution Shift", "model": "Model"},
+            )
+            st.plotly_chart(fig_g, use_container_width=True)
+            st.caption(
+                "A_baseline: +4.8% avg degradation vs ID; F_balanced: -5.6% avg degradation (improvement)."
+            )
+        else:
+            st.info("Run `python scripts/generalize_ppo.py --mode report` to generate generalization data.")
 
 # --- Footer ---
 st.divider()
