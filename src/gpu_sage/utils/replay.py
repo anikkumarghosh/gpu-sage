@@ -34,8 +34,11 @@ def render_ascii_frame(
 ) -> str:
     lines = []
     for i, s in enumerate(gpu_states):
-        # s is like "busy" or "idle" or GPU util bar
-        bar = "█" * int(utilization * width) + "░" * (width - int(utilization * width))
+        # gpu_states entries are already-rendered per-GPU strings (e.g. "GPU 0: ████░░░░")
+        # built by the caller — use them directly instead of recomputing a
+        # uniform bar from the single cluster-wide utilization value.
+        label, _, bar = s.partition(":")
+        bar = bar.strip() if bar else ("█" * int(utilization * width) + "░" * (width - int(utilization * width)))
         lines.append(f"GPU {i}  {bar}")
     lines.append("")
     lines.append("Queue:")
