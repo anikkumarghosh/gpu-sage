@@ -161,13 +161,14 @@ def run_benchmark_cached(
     seeds: list[int],
 ) -> dict[int, dict[str, object]]:
     """Run benchmark using existing engine; cache by scenario+schedulers."""
-    return run_benchmark_detailed(
+    metrics, _per_job = run_benchmark_detailed(
         scenario=scenario,
         seeds=seeds,
         schedulers=schedulers,
         num_jobs=num_jobs,
         num_gpus=num_gpus,
     )
+    return metrics
 
 # ---------------------------------------------------------------------------
 # Render ASCII frame (reuse existing utility)
@@ -606,26 +607,26 @@ with left_col:
                             "No homogeneous-trained PPO model found under artifacts/ppo/. "
                             "Falling back to heuristic scheduler."
                         )
-                from gpu_sage.evaluation.benchmark import run_single_seed_detailed_with_logs, save_benchmark
-                metrics_map, per_job_map, ppo_logs = run_single_seed_detailed_with_logs(
-                    scenario=st.session_state.selected_scenario,
-                    seed=st.session_state.seed_selector,
-                    schedulers=[st.session_state.selected_scheduler],
-                    num_jobs=16,
-                    num_gpus=num_gpus,
-                    ppo_model_path=ppo_path,
-                )
-                seed = st.session_state.seed_selector
-                results = {seed: metrics_map}
-                save_benchmark(
-                    scenario=st.session_state.selected_scenario,
-                    results=results,
-                    out_dir="artifacts/benchmarks",
-                    num_gpus=num_gpus,
-                    num_jobs=16,
-                    per_job_results={seed: per_job_map},
-                    ppo_logs={seed: ppo_logs},
-                )
+            from gpu_sage.evaluation.benchmark import run_single_seed_detailed_with_logs, save_benchmark
+            metrics_map, per_job_map, ppo_logs = run_single_seed_detailed_with_logs(
+                scenario=st.session_state.selected_scenario,
+                seed=st.session_state.seed_selector,
+                schedulers=[st.session_state.selected_scheduler],
+                num_jobs=16,
+                num_gpus=num_gpus,
+                ppo_model_path=ppo_path,
+            )
+            seed = st.session_state.seed_selector
+            results = {seed: metrics_map}
+            save_benchmark(
+                scenario=st.session_state.selected_scenario,
+                results=results,
+                out_dir="artifacts/benchmarks",
+                num_gpus=num_gpus,
+                num_jobs=16,
+                per_job_results={seed: per_job_map},
+                ppo_logs={seed: ppo_logs},
+            )
             st.session_state.benchmark_results = results
             # Build the ONE authoritative LiveState from the simulator
             # We need to extract live state from the results
