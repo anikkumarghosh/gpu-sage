@@ -647,6 +647,7 @@ with left_col:
                 "seed": st.session_state.seed_selector,
                 "live_state": live,  # Store the authoritative live state
             }
+            st.session_state.decision_step_index = 0
             st.rerun()
 
     with col_btn_pause:
@@ -656,28 +657,35 @@ with left_col:
     with col_btn_step:
         if st.button("Step", use_container_width=True):
             if st.session_state.sim_state is not None:
-                # Advance one decision step
-                results = st.session_state.sim_state["results"]
+                # Advance to the NEXT decision-log row instead of re-running
+                # the whole episode and grabbing the last row every time.
+                if "decision_step_index" not in st.session_state:
+                    st.session_state.decision_step_index = 0
                 seed = st.session_state.seed_selector
                 scheduler_name = st.session_state.selected_scheduler
-                # Re-run just the selected scheduler on the same W0
-                schedulers = [st.session_state.selected_scheduler]
-                new_results = run_benchmark_cached(
-                    scenario=st.session_state.selected_scenario,
-                    schedulers=schedulers,
-                    num_jobs=16,
-                    num_gpus=num_gpus,
-                    seeds=[seed],
-                )
-                st.session_state.sim_state["results"] = new_results
-                # Rebuild live state from the new results
-                live = _build_live_state_from_simulator(
-                    metrics_obj=new_results[seed][scheduler_name],
-                    scheduler_name=scheduler_name,
-                    seed=seed,
-                    num_gpus=num_gpus,
-                )
-                st.session_state.sim_state["live_state"] = live
+                ppo_decisions_csv = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_ppo_decisions.csv")
+                if ppo_decisions_csv.exists():
+                    import pandas as pd
+                    ppo_df = pd.read_csv(ppo_decisions_csv)
+                    if not ppo_df.empty:
+                        st.session_state.decision_step_index = min(
+                            st.session_state.decision_step_index + 1, len(ppo_df) - 1
+                        )
+                        row = ppo_df.iloc[st.session_state.decision_step_index]
+                        from types import SimpleNamespace
+                        sjid = int(row.get("selected_job_id", 0))
+                        live = st.session_state.sim_state["live_state"]
+                        live["simulation_time"] = float(row.get("simulation_time", live["simulation_time"]))
+                        live["current_utilization"] = float(row.get("gpu_utilization", live["current_utilization"]))
+                        live["completed_jobs"] = list(range(int(row.get("completed_jobs", 0))))
+                        live["running_jobs"] = list(range(int(row.get("running_jobs", 0))))
+                        live["selected_job"] = SimpleNamespace(
+                            job_id=sjid,
+                            gpu_count=int(row.get("gpu_count", 1)),
+                            priority=int(row.get("priority", 1)),
+                        ) if sjid > 0 else None
+                        live["selected_action"] = sjid if sjid > 0 else None
+                        st.session_state.sim_state["live_state"] = live
                 st.rerun()
             else:
                 st.warning("Start simulation first")
@@ -687,6 +695,7 @@ with left_col:
             # Clear ALL state - no historical values may survive
             st.session_state.sim_state = None
             st.session_state.benchmark_results = None
+            st.session_state.decision_step_index = 0
             # Reset live state to initial
             st.session_state.live_state = {
                 "simulation_time": 0.0,
@@ -755,7 +764,8 @@ with left_col:
                     import pandas as pd
                     ppo_df = pd.read_csv(ppo_decisions_csv)
                     if not ppo_df.empty:
-                        latest = ppo_df.iloc[-1]
+                        step_idx = st.session_state.get("decision_step_index", -1)
+                        latest = ppo_df.iloc[step_idx]
                         sjid = int(latest.get("selected_job_id", 0))
                         running_jobs_count = int(latest.get("running_jobs", 0))
                         completed_from_log = int(latest.get("completed_jobs", 0))
@@ -787,7 +797,8 @@ with left_col:
                     if ppo_decisions_csv.exists():
                         ppo_df = pd.read_csv(ppo_decisions_csv)
                         if not ppo_df.empty:
-                            latest = ppo_df.iloc[-1]
+                            step_idx = st.session_state.get("decision_step_index", -1)
+                            latest = ppo_df.iloc[step_idx]
                             sjid = int(latest.get("selected_job_id", sjid))
                             gr = int(latest.get("gpu_count", gr))
                             pri = int(latest.get("priority", pri))
@@ -872,7 +883,8 @@ with left_col:
                     import pandas as pd
                     ppo_df = pd.read_csv(ppo_decisions_csv)
                     if not ppo_df.empty:
-                        latest = ppo_df.iloc[-1]
+                        step_idx = st.session_state.get("decision_step_index", -1)
+                        latest = ppo_df.iloc[step_idx]
                         sim_time = float(latest.get("simulation_time", sim_time))
                         decision = f"J{int(latest.get('selected_job_id', 0))}" if latest.get("selected_job_id") is not None else "NOOP"
                         running_from_log = int(latest.get("running_jobs", 0))
