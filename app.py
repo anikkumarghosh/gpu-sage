@@ -860,9 +860,6 @@ with left_col:
             st.markdown("#### ASCII Snapshot")
             util = live["current_utilization"]
             n_gpus = live["configured_gpu_count"]
-            gpu_states = [
-                f"GPU {i}: {'█' * int(util * 20) + '░' * (20 - int(util * 20))}" for i in range(n_gpus)
-            ]
             queue_jobs = []
             decision = "NOOP"
             sim_time = live["simulation_time"]
@@ -883,6 +880,27 @@ with left_col:
                         completed_count = completed_from_log
                         # Build queue from log
                         queue_jobs = []  # will be populated below
+
+            # Compute real per-GPU busy/free status from the jobs CSV instead of
+            # smearing one cluster-wide average across every GPU identically.
+            busy_gpu_ids: set[int] = set()
+            jobs_csv_path = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_jobs.csv")
+            if jobs_csv_path.exists():
+                try:
+                    import pandas as pd
+                    jdf = pd.read_csv(jobs_csv_path)
+                    active = jdf[
+                        (jdf["start_time"] <= sim_time) & (jdf["completion_time"] > sim_time)
+                    ]
+                    for ag in active["assigned_gpus"].dropna():
+                        busy_gpu_ids.update(int(x) for x in str(ag).split(",") if x.strip().isdigit())
+                except Exception:
+                    pass
+
+            gpu_states = [
+                f"GPU {i}: {'█' * 20 if i in busy_gpu_ids else '░' * 20}"
+                for i in range(n_gpus)
+            ]
             # Build queue from live state
             for jid in live["waiting_jobs"][:4]:
                 queue_jobs.append(f"J{jid}")
