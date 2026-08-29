@@ -40,15 +40,28 @@ For each `scenario × seed` the benchmark generates workload **W0 once** (seeded
 
 Per-job records (`job_id, arrival/start/completion, waiting/turnaround, gpu/memory, duration, priority, scheduler`) and, for PPO, per-decision logs (`simulation_time, queue_length, selected_job_id, action, reward, free_gpus, gpu_utilization`) are saved for later analysis.
 
-### How to Train PPO
+### How to Train PPO (Showcase Run)
 
 ```bash
-python training/train_ppo.py --steps 250000 --seed 0
-# saves to artifacts/ppo/{final_model.zip, models/, checkpoints/, best/, eval/, tensorboard/}
-# also supports --out custom_dir
+KMP_DUPLICATE_LIB_OK=TRUE python training/train_ppo.py --steps 250000 --seed 0
+# Showcase run creates artifacts/ppo/runs/<20260315_123456_seed0_steps250000>/
+#   config.json          — hyperparams, workload, reward, git hash, python version
+#   training.log         — full terminal output
+#   metrics.csv          — timestep, mean_reward, ep_length, losses
+#   tensorboard/         — event files (tensorboard --logdir <run>/tensorboard)
+#   checkpoints/ppo_*.zip — every 50k steps + final
+#   model/final_model.zip — best and final
+#   plots/reward_curve.png, episode_length.png, loss_curve.png
+#   training_summary.json/txt, TRAINING_REPORT.md
+# Also saves legacy artifacts/ppo/{final_model.zip, models/, checkpoints/}
 ```
 
-Uses `MaskablePPO` with `n_steps=2048`, `batch_size=256`, `gamma=0.99`, etc. Set `KMP_DUPLICATE_LIB_OK=TRUE` on Windows if needed. Large models under `artifacts/ppo/` are not committed.
+Uses `MaskablePPO` with `n_steps=2048`, `batch_size=256`, `gamma=0.99`, etc. Set `KMP_DUPLICATE_LIB_OK=TRUE` on Windows if needed. Large `*.zip` and `tensorboard/` under `artifacts/ppo/` are gitignored; showcase `plots/*.png`, `TRAINING_REPORT.md`, `config.json`, `training_summary.json` are kept for portfolio.
+
+**TensorBoard:**
+```bash
+tensorboard --logdir artifacts/ppo/runs/<run_id>/tensorboard
+```
 
 ### How to Run Evaluation
 

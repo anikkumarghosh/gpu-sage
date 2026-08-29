@@ -1,0 +1,51 @@
+2026-08-29 18:44:50,799 Run ID: 20260829_184450_seed0_steps250000
+2026-08-29 18:44:50,800 Run dir: artifacts\ppo\runs\20260829_184450_seed0_steps250000
+Config: {
+  "run_id": "20260829_184450_seed0_steps250000",
+  "timestamp": "20260829_184450",
+  "timesteps": 250000,
+  "seed": 0,
+  "python_version": "3.13.9",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "git_hash": "38b7c3260939d47df87df646f0eaa565b04ff29b",
+  "cluster": {
+    "num_gpus": 8,
+    "gpu_memory_gb": 80,
+    "gpu_type": "A100"
+  },
+  "workload": {
+    "arrival_rate": 0.08,
+    "min_gpus": 1,
+    "max_gpus": 4,
+    "min_memory_gb": 8,
+    "max_memory_gb": 64,
+    "min_duration": 20,
+    "max_duration": 180,
+    "min_priority": 1,
+    "max_priority": 5
+  },
+  "reward_config": {
+    "throughput": 2.0,
+    "waiting": 0.02,
+    "utilization": 0.25,
+    "fragmentation": 0.25,
+    "invalid_action": 1.0,
+    "idle": 0.01
+  },
+  "ppo_hparams": {
+    "learning_rate": 0.0003,
+    "n_steps": 2048,
+    "batch_size": 256,
+    "n_epochs": 10,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "ent_coef": 0.01,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "policy": "MultiInputPolicy"
+  },
+  "out_dir": "artifacts\\ppo\\runs\\20260829_184450_seed0_steps250000"
+}
+2026-08-29 18:49:59,069 NumExpr defaulting to 16 threads.
+2026-08-29 18:49:59,816 Saved model to artifacts\ppo\runs\20260829_184450_seed0_steps250000\model\final_model.zip

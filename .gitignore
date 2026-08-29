@@ -10,10 +10,18 @@ results/
 tb_logs/
 checkpoints/
 *.egg-info/
-# PPO trained models are large and not committed — see artifacts/ppo/README
-artifacts/ppo/
-*.zip
+# PPO trained models are large — ignore binaries and tensorboard, keep showcase plots/reports
+artifacts/ppo/**/*.zip
+artifacts/ppo/**/tensorboard/
+artifacts/ppo/**/events.out.tfevents.*
+artifacts/ppo/**/checkpoints/*.zip
 !artifacts/benchmarks/*.zip
+# Keep showcase artifacts (plots, reports, configs)
+!artifacts/ppo/runs/*/plots/
+!artifacts/ppo/runs/*/plots/*.png
+!artifacts/ppo/runs/*/TRAINING_REPORT.md
+!artifacts/ppo/runs/*/config.json
+!artifacts/ppo/runs/*/training_summary.json
 # Handoff doc for AI continuity — local only, do not commit
 HANDOFF.md
 AI_HANDOFF.md
