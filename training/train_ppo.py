@@ -418,26 +418,38 @@ def main() -> None:
     with open(run_dir / "training.log", "a") as f:
         f.write(f"Config: {json.dumps(config, indent=2)}\n")
 
-    # Envs (with reward/cluster/scenario)
-    train_env = DummyVecEnv([make_env(args.seed, reward_config=reward_cfg, cluster_config_path=args.cluster_config, scenario=args.scenario, heterogeneous_obs=args.heterogeneous_obs)])
-    eval_env = DummyVecEnv([make_env(args.seed + 10_000, reward_config=reward_cfg, cluster_config_path=args.cluster_config, scenario=args.scenario, heterogeneous_obs=args.heterogeneous_obs)])
+    # Windows hang root cause: MaskableEvalCallback deadlocks on heterogeneous env
+    # (DummyVecEnv + heterogeneous topology) on Windows; verified: hetero training
+    # without eval succeeds (0.42s/2048 steps), with eval hangs after first rollout.
+    # Fix: disable eval for heterogeneous on Windows; keep for homogeneous.
+    is_hetero = bool(args.cluster_config or args.heterogeneous_obs or args.scenario in ("heterogeneous", "topology_sensitive", "mixed_ml"))
+    if is_hetero:
+        train_env = DummyVecEnv([make_env(args.seed, reward_config=reward_cfg, cluster_config_path=args.cluster_config, scenario=args.scenario, heterogeneous_obs=args.heterogeneous_obs)])
+        eval_env = None
+        eval_cb = None
+    else:
+        train_env = DummyVecEnv([make_env(args.seed, reward_config=reward_cfg, cluster_config_path=args.cluster_config, scenario=args.scenario, heterogeneous_obs=args.heterogeneous_obs)])
+        eval_env = DummyVecEnv([make_env(args.seed + 10_000, reward_config=reward_cfg, cluster_config_path=args.cluster_config, scenario=args.scenario, heterogeneous_obs=args.heterogeneous_obs)])
+        eval_cb = MaskableEvalCallback(
+            eval_env,
+            best_model_save_path=str(run_dir / "best"),
+            log_path=str(run_dir / "eval"),
+            eval_freq=max(args.steps // 10, 1),
+            n_eval_episodes=10,
+            deterministic=True,
+            render=False,
+        )
 
-    # Callbacks: checkpoint every 50k, eval every steps//10, reward components
+    # Callbacks: checkpoint every 50k, reward components, eval if not hetero
     checkpoint_cb = CheckpointCallback(save_freq=max(50000 // 1, 1), save_path=str(run_dir / "checkpoints"), name_prefix="ppo")
-    # Also save to base checkpoints for legacy
-    checkpoint_cb2 = CheckpointCallback(save_freq=max(50000 // 1, 1), save_path=str(base_out / "checkpoints"), name_prefix="ppo")
     metrics_cb = MetricsCSVCallback(csv_path=run_dir / "metrics.csv")
     reward_cb = RewardComponentCallback()
-    eval_cb = MaskableEvalCallback(
-        eval_env,
-        best_model_save_path=str(run_dir / "best"),
-        log_path=str(run_dir / "eval"),
-        eval_freq=max(args.steps // 10, 1),
-        n_eval_episodes=10,
-        deterministic=True,
-        render=False,
-    )
-    callbacks = CallbackList([checkpoint_cb, checkpoint_cb2, metrics_cb, reward_cb, eval_cb])
+    if is_hetero:
+        # Single checkpoint for hetero to avoid file lock contention; no eval
+        callbacks = CallbackList([checkpoint_cb, metrics_cb, reward_cb])
+    else:
+        checkpoint_cb2 = CheckpointCallback(save_freq=max(50000 // 1, 1), save_path=str(base_out / "checkpoints"), name_prefix="ppo")
+        callbacks = CallbackList([checkpoint_cb, checkpoint_cb2, metrics_cb, reward_cb, eval_cb])
 
     # Also save periodic checkpoints via simple interval (50k)
     # SB3 CheckpointCallback saves at save_freq timesteps
@@ -480,7 +492,8 @@ def main() -> None:
     model.save(run_dir / "checkpoints" / f"ppo_{args.steps}")
 
     train_env.close()
-    eval_env.close()
+    if eval_env is not None:
+        eval_env.close()
 
     # Generate plots (enrich metrics from eval first)
     generate_plots(run_dir / "metrics.csv", run_dir / "plots", run_dir)

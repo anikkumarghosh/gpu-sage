@@ -231,14 +231,32 @@ effective_runtime = base_runtime * placement_penalty
 
 **Experiment design**: identical W0 per seed/scenario across `FCFS/SJF/Priority/BestFit/TopologyBestFit/PPO`; scenarios `balanced,gpu_heavy,short_jobs,bursty,heavy_tail,priority_skew` preserved, plus `heterogeneous,topology_sensitive,mixed_ml`.
 
-**Results (20 jobs, seed 0, homogeneous PPO `artifacts/ppo/runs/20260829_184233`):**
+**Results (20 jobs, seed 0, homogeneous PPO `artifacts/ppo/runs/20260829_184233` vs heterogeneous PPO `artifacts/ppo_hetero/runs/20260829_224803` 250k):**
 ```
-balanced (homo): FCFS 232 JCT, SJF 227, PPO 230 — competitive
-heterogeneous:   FCFS 205, SJF 173, TopologyBestFit 186, PPO 238 — PPO degrades, TopologyBestFit best
-topology_sensitive: FCFS 850, SJF 549, BestFit 718, TopologyBestFit 767, PPO 514 — PPO best, SJF close
-mixed_ml:        FCFS 315, SJF 298, PPO 300 — PPO near SOTA
+Homogeneous PPO (trained balanced 8×A100, tested):
+  balanced:          PPO 230 ~ SJF 227 — competitive
+  heterogeneous:     PPO 238 vs SJF 173 TopologyBestFit 186 — degrades on hetero
+  topology_sensitive: PPO 514 vs SJF 549 — PPO best on topo-sensitive (homo model transfers surprisingly well)
+  mixed_ml:          PPO 300 vs SJF 298 — near SOTA
+
+Heterogeneous PPO (trained hetero cluster, hetero_obs, reward A, 250k seed 0):
+  heterogeneous:     PPO 258 vs PPO-NoTopo 428 vs homo PPO 238 — topology info helps (258<428) but not enough to beat homo transfer or SJF
+  topology_sensitive: PPO 767 vs PPO-NoTopo 915 vs homo PPO 514 — hetero PPO worse than homo transfer
+  mixed_ml:          PPO 367 vs homo 300
 ```
-Ablation (heterogeneous scenario, 20 jobs): topology-aware `avg_placement_penalty` ~1.10 vs topology-ignored (alpha 0) 1.0 — measurable signal; TopologyBestFit improves over BestFit on heterogeneous.
+**Transfer matrix (JCT, 20 jobs, seed 0):**
+```
+             Test: balanced  heterogeneous  topology_sensitive  mixed_ml
+Train homo PPO   230          238              514                300
+Train hetero PPO 262*         258              767                367   (*hetero PPO on balanced 262)
+```
+`*` hetero PPO on balanced degrades vs homo PPO — specialization cost.
+
+**Topology signal micro-benchmark**: compact `[4,5,6,7]` cost 0.12 pen 1.07 vs spread `[2,3,6,7]` cost 2.76 pen 2.5 — TopologyBestFit picks compact, comm cost 0.861 vs BestFit 1.391 on topo-sensitive.
+
+**Ablation**: `PPO-T (hetero_obs)` beats `PPO-NoTopo` by ~40% on hetero (258 vs 428) and 16% on topo (767 vs 915) — evidence topology info helps, but not yet enough to beat classical `SJF`/`TopologyBestFit`.
+
+**Windows hang fix**: `MaskableEvalCallback` deadlock on Windows with hetero env — disabled eval for hetero training (kept checkpoints/metrics); smoke 5k in 9s, 250k in 5m09s on this host.
 
 **Train heterogeneous PPO:**
 ```bash

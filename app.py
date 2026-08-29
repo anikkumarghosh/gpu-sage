@@ -255,6 +255,17 @@ with st.container():
     )
     st.session_state.selected_scheduler = scheduler
 
+    # PPO model selector (hom vs hetero) — only when PPO chosen
+    if scheduler == "PPO":
+        if "ppo_model_choice" not in st.session_state:
+            st.session_state.ppo_model_choice = "Homogeneous-trained (8xA100)"
+        st.session_state.ppo_model_choice = st.selectbox(
+            "PPO model",
+            options=["Homogeneous-trained (8xA100)", "Heterogeneous-trained (8-hetero)"],
+            index=0 if st.session_state.get("ppo_model_choice") == "Homogeneous-trained (8xA100)" else 1,
+            key="ppo_model_select",
+        )
+
     # GPU count
     num_gpus = st.slider("GPUs", min_value=4, max_value=16, value=8, key="gpu_slider")
 
@@ -275,14 +286,35 @@ with left_col:
             base_jobs = generate_workload(
                 scenario="custom", seed=st.session_state.seed_selector, count=16, config=cfg
             )
+            # Resolve PPO model path if PPO selected
+            ppo_path = None
+            if st.session_state.selected_scheduler == "PPO":
+                choice = st.session_state.get("ppo_model_choice", "Homogeneous-trained (8xA100)")
+                if "Heterogeneous" in choice:
+                    # Prefer hetero 250k model, fall back to hetero 5k
+                    cand = Path("artifacts/ppo_hetero/runs/20260829_224803_seed0_steps250000/model/final_model.zip")
+                    cand2 = Path("artifacts/ppo_hetero_fixed/runs/20260829_224735_seed0_steps5000/model/final_model.zip")
+                    ppo_path = str(cand if cand.exists() else cand2) if (cand.exists() or cand2.exists()) else None
+                else:
+                    cand = Path("artifacts/ppo/runs/20260829_184233_seed0_steps5000/model/final_model.zip")
+                    ppo_path = str(cand) if cand.exists() else None
             # Run one benchmark to get results
-            results = run_benchmark_cached(
-                scenario=st.session_state.selected_scenario,
-                schedulers=[st.session_state.selected_scheduler],
-                num_jobs=16,
-                num_gpus=num_gpus,
-                seeds=[st.session_state.seed_selector],
-            )
+            # Note: run_benchmark_cached currently ignores ppo path; for hetero we use direct run_single_seed with path
+            if ppo_path:
+                from gpu_sage.evaluation.benchmark import run_single_seed as _rss
+                import copy as _cp
+                base_jobs2 = generate_workload(scenario=st.session_state.selected_scenario, seed=st.session_state.seed_selector, count=16)
+                # Use run_single_seed with model for PPO
+                single = _rss(scenario=st.session_state.selected_scenario, seed=st.session_state.seed_selector, schedulers=[st.session_state.selected_scheduler], num_jobs=16, num_gpus=num_gpus, ppo_model_path=ppo_path)
+                results = {st.session_state.seed_selector: single}
+            else:
+                results = run_benchmark_cached(
+                    scenario=st.session_state.selected_scenario,
+                    schedulers=[st.session_state.selected_scheduler],
+                    num_jobs=16,
+                    num_gpus=num_gpus,
+                    seeds=[st.session_state.seed_selector],
+                )
             st.session_state.benchmark_results = results
             st.session_state.sim_state = {
                 "results": results,

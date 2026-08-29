@@ -1,6 +1,7 @@
 """Tests for heterogeneous GPU + topology-aware scheduling (fast)."""
 
 import copy
+from pathlib import Path
 
 import pytest
 
@@ -205,3 +206,76 @@ def test_same_workload_comparison_heterogeneous():
     r1 = run_single_seed(scenario="heterogeneous", seed=7, num_jobs=20)
     r2 = run_single_seed(scenario="heterogeneous", seed=7, num_jobs=20)
     assert r1["FCFS"].throughput == r2["FCFS"].throughput
+
+
+def test_heterogeneous_training_smoke():
+    """Heterogeneous PPO smoke training must complete without hanging (Windows fix)."""
+    import tempfile
+    from pathlib import Path
+
+    from gpu_sage.env.gpu_env import GPUSchedulingEnv
+    from gpu_sage.workloads.generator import get_scenario_config
+    from stable_baselines3.common.vec_env import DummyVecEnv
+    from sb3_contrib import MaskablePPO
+
+    cfg = get_scenario_config("heterogeneous")
+    from pathlib import Path as _P
+    import yaml
+
+    data = yaml.safe_load(_P("configs/heterogeneous_8gpu.yaml").read_text())
+    from gpu_sage.core.cluster import Cluster
+    from gpu_sage.core.topology import Topology
+
+    cluster = Cluster.heterogeneous(data["cluster"]["gpus"])
+    cluster.topology = Topology.two_group(8, 4)
+
+    def make():
+        return GPUSchedulingEnv(num_gpus=8, workload_config=cfg, cluster=cluster, heterogeneous_obs=True, seed=0)
+
+    vec = DummyVecEnv([make])
+    model = MaskablePPO("MultiInputPolicy", vec, verbose=0, seed=0, n_steps=64, batch_size=32)
+    model.learn(128)
+    vec.close()
+    assert model.num_timesteps == 128
+
+
+def test_topology_ablation_config():
+    """PPO-T vs PPO-NoTopo configs must differ only in heterogeneous_obs."""
+    from gpu_sage.env.gpu_env import GPUSchedulingEnv
+    from gpu_sage.workloads.generator import get_scenario_config
+
+    cfg = get_scenario_config("heterogeneous")
+    env_topo = GPUSchedulingEnv(num_gpus=8, workload_config=cfg, heterogeneous_obs=True)
+    env_no = GPUSchedulingEnv(num_gpus=8, workload_config=cfg, heterogeneous_obs=False)
+    assert env_topo.observation_space["gpus"].shape[1] == 5
+    assert env_no.observation_space["gpus"].shape[1] == 3
+    assert env_topo.observation_space["cluster"].shape[0] == 8
+    assert env_no.observation_space["cluster"].shape[0] == 6
+
+
+def test_heterogeneous_model_loading(tmp_path=None):
+    """Heterogeneous model artifacts must be loadable if present."""
+    from pathlib import Path
+
+    # Check smoke model exists from earlier 5k run
+    cand = Path("artifacts/ppo_hetero_fixed/runs/20260829_224735_seed0_steps5000/model/final_model.zip")
+    cand2 = Path("artifacts/ppo_hetero/runs/20260829_224803_seed0_steps250000/model/final_model.zip")
+    p = cand if cand.exists() else cand2
+    if not p.exists():
+        pytest.skip("No heterogeneous model artifact yet")
+    from sb3_contrib import MaskablePPO
+
+    m = MaskablePPO.load(str(p))
+    assert m is not None
+    # Check obs shape matches hetero
+    assert m.observation_space["gpus"].shape[1] == 5
+
+
+def test_deterministic_heterogeneous_evaluation():
+    model = Path("artifacts/ppo_hetero_fixed/runs/20260829_224735_seed0_steps5000/model/final_model.zip")
+    if not model.exists():
+        pytest.skip("No hetero smoke model")
+    r1 = run_single_seed(scenario="heterogeneous", seed=0, num_jobs=20, schedulers=["PPO"], ppo_model_path=str(model))
+    r2 = run_single_seed(scenario="heterogeneous", seed=0, num_jobs=20, schedulers=["PPO"], ppo_model_path=str(model))
+    assert r1["PPO"].average_waiting_time == r2["PPO"].average_waiting_time
+    assert r1["PPO"].average_turnaround_time == r2["PPO"].average_turnaround_time
