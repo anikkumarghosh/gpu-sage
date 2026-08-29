@@ -1,0 +1,15 @@
+cluster:
+  num_gpus: 8
+  gpu_memory_gb: 80
+  gpu_type: A100
+
+workload:
+  arrival_rate: 0.15
+  min_gpus: 1
+  max_gpus: 4
+  min_memory_gb: 8
+  max_memory_gb: 64
+  min_duration: 20
+  max_duration: 200
+  min_priority: 1
+  max_priority: 5
