@@ -355,7 +355,12 @@ def _build_live_state_from_simulator(
                 sim_time = float(latest.get("simulation_time", 0.0))
                 sjid = int(latest.get("selected_job_id", 0))
                 if sjid > 0:
-                    selected_job_id = sjid
+                    from types import SimpleNamespace
+                    selected_job = SimpleNamespace(
+                        job_id=sjid,
+                        gpu_count=int(latest.get("gpu_count", 1)),
+                        priority=int(latest.get("priority", 1)),
+                    )
                     selected_action = sjid
                     # Get reward components from the same decision
                     reward_components = {
@@ -500,7 +505,7 @@ with st.container():
     with c1:
         st.markdown("### GPU-Sage")
     with c2:
-        st.select_scenario = st.selectbox(
+        chosen_scenario = st.selectbox(
             "Workload scenario",
             options=SCENARIO_NAMES,
             index=SCENARIO_NAMES.index(st.session_state.selected_scenario)
@@ -508,11 +513,13 @@ with st.container():
             else 0,
             key="scenario_select",
         )
+        st.session_state.selected_scenario = chosen_scenario
     with c3:
-        pass  # selected_scenario updated by selectbox above
+        pass
+
 
     # Scheduler selector
-    st.selectbox(
+    chosen_scheduler = st.selectbox(
         "Scheduler",
         options=st.session_state.scheduler_names,
         index=(
@@ -524,6 +531,7 @@ with st.container():
         ),
         key="scheduler_select",
     )
+    st.session_state.selected_scheduler = chosen_scheduler
 
     # PPO model selector (hom vs hetero vs graph) — only when PPO chosen
     scheduler = st.session_state.selected_scheduler
@@ -957,14 +965,14 @@ with left_col:
     # --- STATE CONSISTENCY DEBUG (development only) ---
     with st.expander("State Consistency Debug", expanded=False):
         live = st.session_state.sim_state.get("live_state", {}) if st.session_state.sim_state else {}
-        sim_time = live.get("simulation_time", "N/A")
+        sim_time = live.get("simulation_time", 0.0)
         completed = len(live.get("completed_jobs", []))
         waiting = len(live.get("waiting_jobs", []))
         running = len(live.get("running_jobs", []))
-        selected = live.get("selected_job", "N/A")
-        selected_action = live.get("selected_action", "N/A")
-        util = live.get("current_utilization", "N/A")
-        gpu_count = live.get("configured_gpu_count", "N/A")
+        selected = live.get("selected_job", None)
+        selected_action = live.get("selected_action", None)
+        util = live.get("current_utilization", 0.0)
+        gpu_count = live.get("configured_gpu_count", None)
         print_parts = [
             f"simulation_time: {sim_time}",
             f"completed: {completed}",
