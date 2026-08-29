@@ -30,6 +30,17 @@ from sb3_contrib import MaskablePPO
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 # ---------------------------------------------------------------------------
+# Helper: find the most recently trained final_model.zip matching a glob.
+# Useful when model checkpoints live in timestamped run directories;
+# the script will surface a visible warning instead of silently
+# falling back to a heuristic and falsely labeling output "PPO".
+# ---------------------------------------------------------------------------
+def _latest_model(glob_pattern: str) -> Path | None:
+    """Find the most recently trained final_model.zip matching a glob."""
+    matches = sorted(Path(".").glob(glob_pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches[0] if matches else None
+
+# ---------------------------------------------------------------------------
 # Training distribution (documented from code inspection)
 # ---------------------------------------------------------------------------
 TRAINING_CONFIG = {
@@ -200,10 +211,40 @@ def main(argv=None):
           f"{TRAINING_CONFIG['min_priority']}-{TRAINING_CONFIG['max_priority']} priority, "
           f"{TRAINING_CONFIG['num_gpus']} GPUs x {TRAINING_CONFIG['gpu_memory_gb']}GB A100")
 
-    # Resolve model paths: use args if supplied, fall back to legacy defaults
-    # only if the files actually exist (so old one-liners still work if paths happen to exist)
-    model_a = args.model_a if args.model_a and Path(args.model_a).exists() else None
-    model_f = args.model_f if args.model_f and Path(args.model_f).exists() else None
+    # Resolve model paths: use args if supplied and valid;
+    # otherwise try _latest_model() under the expected output directory
+    # and print a loud warning if neither the arg nor a on-disk model is found.
+    if args.model_a and Path(args.model_a).exists():
+        model_a = Path(args.model_a)
+    else:
+        model_a = _latest_model(
+            "artifacts/reward_ablation/full/A_baseline/runs/*/model/final_model.zip"
+        )
+        if model_a is None:
+            print(
+                "[warning] No trained A_baseline model found — "
+                "PPO results for A_baseline will be heuristic fallback, not real PPO."
+            )
+        else:
+            print(
+                "[info] Using auto-detected A_baseline model: {}.".format(model_a)
+            )
+
+    if args.model_f and Path(args.model_f).exists():
+        model_f = Path(args.model_f)
+    else:
+        model_f = _latest_model(
+            "artifacts/reward_ablation/full/F_balanced/runs/*/model/final_model.zip"
+        )
+        if model_f is None:
+            print(
+                "[warning] No trained F_balanced model found — "
+                "PPO results for F_balanced will be heuristic fallback, not real PPO."
+            )
+        else:
+            print(
+                "[info] Using auto-detected F_balanced model: {}.".format(model_f)
+            )
 
     # ---- In-distribution (balanced) ----
     if args.mode in ["id", "all"]:
