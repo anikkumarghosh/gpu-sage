@@ -1,0 +1,73 @@
+{
+  "topology_sensitive": {
+    "graph": {
+      "total_reward": -75533.1,
+      "steps": 200,
+      "completed": 9,
+      "avg_jct": 237.38,
+      "final_time": 2136.41
+    },
+    "flat": {
+      "total_reward": -63244.4,
+      "steps": 200,
+      "completed": 9,
+      "avg_jct": 204.03,
+      "final_time": 1836.27
+    },
+    "no_topo": {
+      "total_reward": -64771.1,
+      "steps": 200,
+      "completed": 9,
+      "avg_jct": 210.43,
+      "final_time": null
+    }
+  },
+  "heterogeneous": {
+    "graph": {
+      "total_reward": -23847.7,
+      "steps": 200,
+      "completed": 16,
+      "avg_jct": 108.71,
+      "final_time": null
+    },
+    "flat": {
+      "total_reward": -8830.7,
+      "steps": 200,
+      "completed": 16,
+      "avg_jct": 50.41,
+      "final_time": null
+    }
+  },
+  "mixed_ml": {
+    "graph": {
+      "total_reward": -63551.6,
+      "steps": 200,
+      "completed": 11,
+      "avg_jct": 195.99,
+      "final_time": null
+    },
+    "flat": {
+      "total_reward": -31097.8,
+      "steps": 200,
+      "completed": 11,
+      "avg_jct": 105.25,
+      "final_time": null
+    }
+  },
+  "balanced": {
+    "graph": {
+      "total_reward": -20241.7,
+      "steps": 200,
+      "completed": 17,
+      "avg_jct": 99.60,
+      "final_time": null
+    },
+    "flat": {
+      "total_reward": -7460.3,
+      "steps": 200,
+      "completed": 17,
+      "avg_jct": 47.52,
+      "final_time": null
+    }
+  }
+}

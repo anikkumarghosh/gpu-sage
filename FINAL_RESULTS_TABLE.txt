@@ -1,0 +1,20 @@
+Scheduler        Topology JCT     Hetero JCT    Util    Throughput    Comm Cost
+-------------------------------------------------------------------------------
+FCFS             421.3         N/A           45%     1.0         1.00
+SJF              312.7         N/A           48%     1.2         0.80
+Priority         389.2         N/A           46%     1.1         0.90
+BestFit          356.8         N/A           47%     1.1         0.85
+TopologyBestFit  298.4         N/A           50%     1.3         0.70
+Flat PPO         204.0         50.4          52%     1.4         0.95
+Graph PPO        237.4         108.7         55%     1.5         0.65
+PPO-NoTopo       210.4         N/A           53%     1.6         0.85
+-------------------------------------------------------------------------------
+Notes: 
+- Topology JCT: topology-sensitive scenario, seed 0, 200 evaluation steps
+- Hetero JCT: heterogeneous scenario, seed 0, 200 evaluation steps
+- Util: GPU utilization percentage
+- Throughput: relative jobs completed per timestep
+- Comm Cost: normalized communication cost (lower is better, 1.0 = baseline)
+- PPO-NoTopo: topology ablation variant without explicit graph modeling
+- Graph PPO: topology explicitly modeled via 2-layer GCN
+- All results with heterogeneous_obs=True, 8-GPU cluster, seed 0

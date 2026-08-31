@@ -27,15 +27,15 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 # Project imports (reuse existing modules — no recreation)
 # ---------------------------------------------------------------------------
-from src.gpu_sage.evaluation.benchmark import run_benchmark_detailed, aggregate_results, per_seed_dataframe, run_single_seed_detailed_with_logs
-from src.gpu_sage.evaluation.metrics import compute_metrics
-from src.gpu_sage.workloads.generator import SCENARIO_NAMES, generate_workload, get_scenario_config, WorkloadConfig
-from src.gpu_sage.core.cluster import Cluster
-from src.gpu_sage.core.simulator import Simulator
-from src.gpu_sage.core.topology import Topology
-from src.gpu_sage.schedulers.fcfs import FCFSScheduler
-from src.gpu_sage.schedulers.heuristics import BestFitScheduler, PriorityScheduler, SJFScheduler, TopologyBestFitScheduler
-from src.gpu_sage.env.gpu_env import GPUSchedulingEnv
+from gpu_sage.evaluation.benchmark import run_benchmark_detailed, aggregate_results, per_seed_dataframe, run_single_seed_detailed_with_logs
+from gpu_sage.evaluation.metrics import compute_metrics
+from gpu_sage.workloads.generator import SCENARIO_NAMES, generate_workload, get_scenario_config, WorkloadConfig
+from gpu_sage.core.cluster import Cluster
+from gpu_sage.core.simulator import Simulator
+from gpu_sage.core.topology import Topology
+from gpu_sage.schedulers.fcfs import FCFSScheduler
+from gpu_sage.schedulers.heuristics import BestFitScheduler, PriorityScheduler, SJFScheduler, TopologyBestFitScheduler
+from gpu_sage.env.gpu_env import GPUSchedulingEnv
 from sb3_contrib import MaskablePPO
 
 # Allow duplicate OpenMP libs on Windows
@@ -184,7 +184,7 @@ def render_ascii_frame(
     width: int = 20,
 ) -> str:
     """Render a single ASCII frame from the existing replay utility."""
-    from src.gpu_sage.utils.replay import render_ascii_frame as _render
+    from gpu_sage.utils.replay import render_ascii_frame as _render
 
     return _render(gpu_states, queue, decision, utilization, completed, sim_time, width)
 
@@ -435,7 +435,7 @@ def _initialize_live_state_from_scratch(scenario: str, num_gpus: int, scheduler_
     This ensures: simulation_time=0, completed_jobs=0, queue populated from
     initial workload, no historical values survive.
     """
-    from src.gpu_sage.workloads.generator import generate_workload
+    from gpu_sage.workloads.generator import generate_workload
 
     cfg = get_scenario_config(scenario)
     base_jobs = generate_workload(
@@ -443,18 +443,19 @@ def _initialize_live_state_from_scratch(scenario: str, num_gpus: int, scheduler_
     )
 
     # Create a fresh simulator with the scheduler
-    from src.gpu_sage.schedulers.base import Scheduler
-    from src.gpu_sage.schedulers.fcfs import FCFSScheduler
-    from src.gpu_sage.schedulers.rl import RLScheduler
+    from gpu_sage.schedulers.base import Scheduler
+    from gpu_sage.schedulers.fcfs import FCFSScheduler
+    from gpu_sage.schedulers.rl import RLScheduler
 
     if scheduler_name == "PPO":
         scheduler = RLScheduler()
     else:
+        from gpu_sage.schedulers.heuristics import BestFitScheduler, PriorityScheduler, SJFScheduler
         scheduler_map = {
             "FCFS": FCFSScheduler(),
-            "SJF": None,  # will use default
-            "Priority": None,
-            "BestFit": None,
+            "SJF": SJFScheduler(),
+            "Priority": PriorityScheduler(),
+            "BestFit": BestFitScheduler(),
         }
         scheduler = scheduler_map.get(scheduler_name, FCFSScheduler())
 
@@ -673,16 +674,25 @@ with left_col:
                         )
                         row = ppo_df.iloc[st.session_state.decision_step_index]
                         from types import SimpleNamespace
-                        sjid = int(row.get("selected_job_id", 0))
+                        
+                        def _safe_int(k, default=0):
+                            v = row.get(k, default)
+                            return int(v) if pd.notna(v) else default
+                            
+                        def _safe_float(k, default=0.0):
+                            v = row.get(k, default)
+                            return float(v) if pd.notna(v) else default
+                            
+                        sjid = _safe_int("selected_job_id", 0)
                         live = st.session_state.sim_state["live_state"]
-                        live["simulation_time"] = float(row.get("simulation_time", live["simulation_time"]))
-                        live["current_utilization"] = float(row.get("gpu_utilization", live["current_utilization"]))
-                        live["completed_jobs"] = list(range(int(row.get("completed_jobs", 0))))
-                        live["running_jobs"] = list(range(int(row.get("running_jobs", 0))))
+                        live["simulation_time"] = _safe_float("simulation_time", live["simulation_time"])
+                        live["current_utilization"] = _safe_float("gpu_utilization", live["current_utilization"])
+                        live["completed_jobs"] = list(range(_safe_int("completed_jobs", 0)))
+                        live["running_jobs"] = list(range(_safe_int("running_jobs", 0)))
                         live["selected_job"] = SimpleNamespace(
                             job_id=sjid,
-                            gpu_count=int(row.get("gpu_count", 1)),
-                            priority=int(row.get("priority", 1)),
+                            gpu_count=_safe_int("gpu_count", 1),
+                            priority=_safe_int("priority", 1),
                         ) if sjid > 0 else None
                         live["selected_action"] = sjid if sjid > 0 else None
                         st.session_state.sim_state["live_state"] = live
@@ -766,10 +776,18 @@ with left_col:
                     if not ppo_df.empty:
                         step_idx = st.session_state.get("decision_step_index", -1)
                         latest = ppo_df.iloc[step_idx]
-                        sjid = int(latest.get("selected_job_id", 0))
-                        running_jobs_count = int(latest.get("running_jobs", 0))
-                        completed_from_log = int(latest.get("completed_jobs", 0))
-                        sim_time_from_log = float(latest.get("simulation_time", 0))
+                        def _safe_int(k, default=0):
+                            v = latest.get(k, default)
+                            return int(v) if pd.notna(v) else default
+                            
+                        def _safe_float(k, default=0.0):
+                            v = latest.get(k, default)
+                            return float(v) if pd.notna(v) else default
+                            
+                        sjid = _safe_int("selected_job_id", 0)
+                        running_jobs_count = _safe_int("running_jobs", 0)
+                        completed_from_log = _safe_int("completed_jobs", 0)
+                        sim_time_from_log = _safe_float("simulation_time", 0)
                         # Show jobs from the decision log
                         st.caption(f"**Simulation Time:** {sim_time_from_log:.0f}s")
                         st.caption(f"**Running Jobs:** {running_jobs_count}  **Completed From Log:** {completed_from_log}")
@@ -799,18 +817,22 @@ with left_col:
                         if not ppo_df.empty:
                             step_idx = st.session_state.get("decision_step_index", -1)
                             latest = ppo_df.iloc[step_idx]
-                            sjid = int(latest.get("selected_job_id", sjid))
-                            gr = int(latest.get("gpu_count", gr))
-                            pri = int(latest.get("priority", pri))
-                            wt = float(latest.get("waiting_time", 0.0))
-                            free_gpus = int(latest.get("free_gpus", free_gpus))
-                            action = int(latest.get("action", 0))
-                            reward = float(latest.get("reward", 0.0))
-                            throughput_reward = float(latest.get("throughput_reward", 0.0))
-                            waiting_penalty = float(latest.get("waiting_penalty", 0.0))
-                            utilization_reward = float(latest.get("utilization_reward", 0.0))
-                            fragmentation_penalty = float(latest.get("fragmentation_penalty", 0.0))
-                            idle_penalty = float(latest.get("idle_penalty", 0.0))
+                            def _si(k, default=0):
+                                v = latest.get(k, default); return int(v) if pd.notna(v) else default
+                            def _sf(k, default=0.0):
+                                v = latest.get(k, default); return float(v) if pd.notna(v) else default
+                            sjid = _si("selected_job_id", sjid)
+                            gr = _si("gpu_count", gr)
+                            pri = _si("priority", pri)
+                            wt = _sf("waiting_time", 0.0)
+                            free_gpus = _si("free_gpus", free_gpus)
+                            action = _si("action", 0)
+                            reward = _sf("reward", 0.0)
+                            throughput_reward = _sf("throughput_reward", 0.0)
+                            waiting_penalty = _sf("waiting_penalty", 0.0)
+                            utilization_reward = _sf("utilization_reward", 0.0)
+                            fragmentation_penalty = _sf("fragmentation_penalty", 0.0)
+                            idle_penalty = _sf("idle_penalty", 0.0)
                         else:
                             sjid, gr, pri, wt = 0, 1, 1, 0.0
                             free_gpus = 0
