@@ -625,8 +625,16 @@ with left_col:
             )
             seed = st.session_state.seed_selector
             results = {seed: metrics_map}
+
+            # save_benchmark() overwrites {scenario}_agg.csv wholesale, but a
+            # Start click only benchmarks ONE scheduler — so without merging,
+            # every other scheduler's row for this scenario would be wiped.
+            scen = st.session_state.selected_scenario
+            agg_path = Path("artifacts/benchmarks") / f"{scen}_agg.csv"
+            prior_agg = pd.read_csv(agg_path) if agg_path.exists() else None
+
             save_benchmark(
-                scenario=st.session_state.selected_scenario,
+                scenario=scen,
                 results=results,
                 out_dir="artifacts/benchmarks",
                 num_gpus=num_gpus,
@@ -634,6 +642,14 @@ with left_col:
                 per_job_results={seed: per_job_map},
                 ppo_logs={seed: ppo_logs},
             )
+
+            new_agg = pd.read_csv(agg_path)
+            if prior_agg is not None and not prior_agg.empty:
+                ran_scheduler = st.session_state.selected_scheduler
+                prior_agg = prior_agg[prior_agg["scheduler"] != ran_scheduler]
+                merged_agg = pd.concat([prior_agg, new_agg], ignore_index=True)
+                merged_agg.to_csv(agg_path, index=False)
+
             st.session_state.benchmark_results = results
             # Reload aggregate benchmark data so the Comparison Charts panel
             # reflects the run that was just saved (was previously loaded
