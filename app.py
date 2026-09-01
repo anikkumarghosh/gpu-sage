@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from copy import deepcopy
 from pathlib import Path
 
@@ -27,7 +28,7 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 # Project imports (reuse existing modules — no recreation)
 # ---------------------------------------------------------------------------
-from gpu_sage.evaluation.benchmark import run_benchmark_detailed, aggregate_results, per_seed_dataframe, run_single_seed_detailed_with_logs
+from gpu_sage.evaluation.benchmark import run_benchmark_detailed, aggregate_results, per_seed_dataframe, run_single_seed_detailed_with_logs, DEFAULT_SCHEDULERS
 from gpu_sage.evaluation.metrics import compute_metrics
 from gpu_sage.workloads.generator import SCENARIO_NAMES, generate_workload, get_scenario_config, WorkloadConfig
 from gpu_sage.core.cluster import Cluster
@@ -614,25 +615,35 @@ with left_col:
                             "No homogeneous-trained PPO model found under artifacts/ppo/. "
                             "Falling back to heuristic scheduler."
                         )
+            # Auto-advance the seed on repeated Start clicks with unchanged
+            # settings so results are visibly different each time, instead of
+            # silently reproducing an identical run (workload gen is
+            # deterministic per scenario+seed).
+            run_key = (st.session_state.selected_scenario, st.session_state.selected_scheduler)
+            if st.session_state.get("_last_run_key") == run_key:
+                st.session_state.seed_selector = (st.session_state.seed_selector + 1) % 1000
+            st.session_state["_last_run_key"] = run_key
+
             from gpu_sage.evaluation.benchmark import run_single_seed_detailed_with_logs, save_benchmark
+
+            # Race ALL schedulers on the exact same generated job stream/seed —
+            # this is the actual comparison, not 5 independent overwritten runs.
+            st.session_state.simulation_complete = False
+            all_schedulers = DEFAULT_SCHEDULERS + ["PPO"]
             metrics_map, per_job_map, ppo_logs = run_single_seed_detailed_with_logs(
                 scenario=st.session_state.selected_scenario,
                 seed=st.session_state.seed_selector,
-                schedulers=[st.session_state.selected_scheduler],
+                schedulers=all_schedulers,
                 num_jobs=16,
                 num_gpus=num_gpus,
                 ppo_model_path=ppo_path,
             )
             seed = st.session_state.seed_selector
             results = {seed: metrics_map}
-
-            # save_benchmark() overwrites {scenario}_agg.csv wholesale, but a
-            # Start click only benchmarks ONE scheduler — so without merging,
-            # every other scheduler's row for this scenario would be wiped.
             scen = st.session_state.selected_scenario
-            agg_path = Path("artifacts/benchmarks") / f"{scen}_agg.csv"
-            prior_agg = pd.read_csv(agg_path) if agg_path.exists() else None
 
+            # All schedulers ran together this click, so this write is now a
+            # complete, correct set of rows for the scenario — no merge needed.
             save_benchmark(
                 scenario=scen,
                 results=results,
@@ -643,14 +654,41 @@ with left_col:
                 ppo_logs={seed: ppo_logs},
             )
 
-            new_agg = pd.read_csv(agg_path)
-            if prior_agg is not None and not prior_agg.empty:
-                ran_scheduler = st.session_state.selected_scheduler
-                prior_agg = prior_agg[prior_agg["scheduler"] != ran_scheduler]
-                merged_agg = pd.concat([prior_agg, new_agg], ignore_index=True)
-                merged_agg.to_csv(agg_path, index=False)
-
             st.session_state.benchmark_results = results
+
+            # --- Animate the selected scheduler's run: replay jobs arriving,
+            # starting, and completing over simulated time using the real
+            # per-job timestamps from the run that just happened. ---
+            selected_records = per_job_map.get(st.session_state.selected_scheduler, [])
+            anim_placeholder = st.empty()
+            if selected_records:
+                events = []
+                for r in selected_records:
+                    events.append((r["arrival_time"], "arrive", r["job_id"]))
+                    events.append((r["start_time"], "start", r["job_id"]))
+                    events.append((r["completion_time"], "complete", r["job_id"]))
+                events.sort(key=lambda e: e[0])
+
+                waiting_set, running_set, completed_set = set(), set(), set()
+                sleep_per_event = max(0.03, min(0.15, 3.0 / max(len(events), 1)))
+                for t, kind, jid in events:
+                    if kind == "arrive":
+                        waiting_set.add(jid)
+                    elif kind == "start":
+                        waiting_set.discard(jid)
+                        running_set.add(jid)
+                    elif kind == "complete":
+                        running_set.discard(jid)
+                        completed_set.add(jid)
+                    with anim_placeholder.container():
+                        st.caption(
+                            f"**Simulating {st.session_state.selected_scheduler}…**  "
+                            f"t={t:.0f}s  |  Waiting: {len(waiting_set)}  |  "
+                            f"Running: {len(running_set)}  |  Completed: {len(completed_set)}"
+                        )
+                        st.progress(min(len(completed_set) / max(len(selected_records), 1), 1.0))
+                    time.sleep(sleep_per_event)
+            anim_placeholder.empty()
             # Reload aggregate benchmark data so the Comparison Charts panel
             # reflects the run that was just saved (was previously loaded
             # once at session start and never refreshed).
@@ -661,6 +699,7 @@ with left_col:
                 fdf["scenario"] = csv_file.stem.replace("_agg", "")
                 frames.append(fdf)
             st.session_state.df_agg = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            st.session_state.simulation_complete = True
             # Build the ONE authoritative LiveState from the simulator
             # We need to extract live state from the results
             seed = st.session_state.seed_selector
@@ -744,6 +783,7 @@ with left_col:
             st.session_state.sim_state = None
             st.session_state.benchmark_results = None
             st.session_state.decision_step_index = 0
+            st.session_state.simulation_complete = False
             # Reset live state to initial
             st.session_state.live_state = {
                 "simulation_time": 0.0,
@@ -1121,8 +1161,9 @@ with left_col:
 with right_col:
     st.subheader("Comparison Charts")
 
-    # Ensure we have benchmark data
-    if st.session_state.df_agg.empty:
+    if not st.session_state.get("simulation_complete", False):
+        st.info("Click **Start** to race all schedulers on the same job stream — results appear here once it finishes.")
+    elif st.session_state.df_agg.empty:
         st.info("No benchmark data loaded — click **Start** to run a simulation.")
     else:
         # --- Chart 1: Average Waiting Time ---
