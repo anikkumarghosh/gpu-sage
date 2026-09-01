@@ -246,6 +246,7 @@ def _build_live_state_from_simulator(
     scheduler_name: str | None = None,
     seed: int | None = None,
     metrics_obj: object | None = None,
+    per_job_records: list[dict] | None = None,
 ) -> dict:
     """Build the one authoritative LiveState.
 
@@ -349,7 +350,7 @@ def _build_live_state_from_simulator(
         running_jobs: list[int] = []
         completed_jobs_list: list[int] = []
 
-        if ppo_decisions_csv.exists():
+        if scheduler_name == "PPO" and ppo_decisions_csv.exists():
             ppo_df = pd.read_csv(ppo_decisions_csv)
             if not ppo_df.empty:
                 latest = ppo_df.iloc[-1]
@@ -388,12 +389,17 @@ def _build_live_state_from_simulator(
 
         # If no PPO decision log, use metrics-based initial state
         if selected_job is None:
-            # Use metrics to derive basic state
-            sim_time = 0.0
-            # completed count from metrics
-            completed_jobs_list = [0]  # will be rendered as len(completed_jobs)
-            # waiting/running from scheduler behavior can't be derived without sim,
-            # so we leave them empty and let the UI show "0" / display from job CSV if needed
+            # Build real waiting/running/completed job-id lists from the
+            # per-job records produced by this run, instead of a hardcoded
+            # placeholder that always showed "Completed Jobs: 1".
+            if per_job_records:
+                completed_jobs_list = [r["job_id"] for r in per_job_records if r.get("status") == "completed"]
+                running_jobs = [r["job_id"] for r in per_job_records if r.get("status") == "running"]
+                waiting_jobs = [r["job_id"] for r in per_job_records if r.get("status") not in ("completed", "running")]
+                sim_time = max((r.get("completion_time", 0.0) for r in per_job_records), default=0.0)
+            else:
+                sim_time = 0.0
+                completed_jobs_list = []
 
         return {
             "simulation_time": sim_time,
@@ -629,15 +635,30 @@ with left_col:
                 ppo_logs={seed: ppo_logs},
             )
             st.session_state.benchmark_results = results
+            # Reload aggregate benchmark data so the Comparison Charts panel
+            # reflects the run that was just saved (was previously loaded
+            # once at session start and never refreshed).
+            agg_dir = Path("artifacts/benchmarks")
+            frames = []
+            for csv_file in agg_dir.glob("*_agg.csv"):
+                fdf = pd.read_csv(csv_file)
+                fdf["scenario"] = csv_file.stem.replace("_agg", "")
+                frames.append(fdf)
+            st.session_state.df_agg = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
             # Build the ONE authoritative LiveState from the simulator
             # We need to extract live state from the results
             seed = st.session_state.seed_selector
             scheduler_name = st.session_state.selected_scheduler
             if seed in results and scheduler_name in results[seed]:
                 metrics_obj = results[seed][scheduler_name]
-                # Build a minimal simulator state from the metrics
-                # The LiveState will use decision logs for PPO, or just show initial state for heuristics
-                live = _build_live_state_from_simulator(metrics_obj=metrics_obj, scheduler_name=scheduler_name, seed=seed, num_gpus=num_gpus)
+                # Build LiveState from the metrics + real per-job records for this run
+                live = _build_live_state_from_simulator(
+                    metrics_obj=metrics_obj,
+                    scheduler_name=scheduler_name,
+                    seed=seed,
+                    num_gpus=num_gpus,
+                    per_job_records=per_job_map.get(scheduler_name),
+                )
             else:
                 live = _initialize_live_state_from_scratch(st.session_state.selected_scenario, num_gpus, scheduler_name)
             st.session_state.sim_state = {
@@ -653,6 +674,7 @@ with left_col:
 
     with col_btn_pause:
         if st.button("Pause", use_container_width=True):
+            st.session_state.sim_paused = True
             st.info("Simulation paused")
 
     with col_btn_step:
@@ -665,7 +687,7 @@ with left_col:
                 seed = st.session_state.seed_selector
                 scheduler_name = st.session_state.selected_scheduler
                 ppo_decisions_csv = Path(f"artifacts/benchmarks/{st.session_state.selected_scenario}_ppo_decisions.csv")
-                if ppo_decisions_csv.exists():
+                if scheduler_name == "PPO" and ppo_decisions_csv.exists():
                     import pandas as pd
                     ppo_df = pd.read_csv(ppo_decisions_csv)
                     if not ppo_df.empty:

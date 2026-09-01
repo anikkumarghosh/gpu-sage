@@ -23,8 +23,16 @@ env = GPUSchedulingEnv(
 obs, info = env.reset(seed=0)
 print('Env observation space keys:', list(env.observation_space.spaces.keys()))
 
-# Load the new graph model (trained with --heterogeneous-obs)
-model = MaskablePPO.load('artifacts/ppo/runs/20260829_235327_seed0_steps128/model/final_model.zip')
+# Load the newest available graph model (trained with --heterogeneous-obs)
+from pathlib import Path
+_candidates = sorted(
+    Path("artifacts/ppo/runs").glob("*/model/final_model.zip"),
+    key=lambda p: p.stat().st_mtime,
+    reverse=True,
+)
+if not _candidates:
+    raise FileNotFoundError("No trained model found under artifacts/ppo/runs/*/model/final_model.zip")
+model = MaskablePPO.load(str(_candidates[0]))
 print('Model features_extractor_class:', model.policy.features_extractor_class)
 print('Model observation space keys:', list(model.policy.observation_space.spaces.keys()))
 print('Model cluster dim:', model.policy.observation_space.spaces['cluster'].shape)
